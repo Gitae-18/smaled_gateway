@@ -79,7 +79,7 @@ int main() {
 
     init_lis3dhtr();
 
-    unsigned char command[] = { 0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79 };
+    char command[] = { 0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79 };
 
     while (1) {
         serWrite(sensor_fd, command, sizeof(command));
@@ -91,6 +91,7 @@ int main() {
         }
 
         unsigned char receivedSensor[9];
+
         for (int i = 0; i < 9; i++) {
             receivedSensor[i] = serReadByte(h2s_fd);
         }
@@ -106,17 +107,33 @@ int main() {
         double co   = (dataFromSensor[17] * 256 + dataFromSensor[18]) * 0.1;
         double o3   = (dataFromSensor[19] * 256 + dataFromSensor[20]) * 0.1;
         double no2  = (dataFromSensor[21] * 256 + dataFromSensor[22]) * 0.1;
-        double h2s  = (receivedSensor[2] * 256 + receivedSensor[3]) / 10.0;
+//        double h2s  = (receivedSensor[2] * 256 + receivedSensor[3]) / 10.0;
 
         
 
-        printf("[ENV] Temp: %.2f\u00b0C, Humi: %.2f%%, PM2.5: %.2f, CO2: %.0f, H2S: %.1f\n",
-               temp, humi, pm25, co2, h2s);
+        printf("[ENV] Temp: %.2f\u00b0C, Humi: %.2f%%, PM2.5: %.2f, CO2: %.0f\n",
+               temp, humi, pm25, co2);
         double ax, ay, az;
         read_lis3dhtr_axes(&ax, &ay, &az);
         printf("LIS3DHTR -> X: %.3fg, Y: %.3fg, Z: %.3fg\n", ax, ay, az);
 
-        time_sleep(1);
+        time_t now = time(NULL);
+        printf(
+            "{\"t\":\"gw_env\",\"ts\":%ld,"
+            "\"temp\":%.2f,\"humi\":%.2f,"
+            "\"pm1\":%.2f,\"pm25\":%.2f,\"pm10\":%.2f,"
+            "\"co2\":%.0f,\"voc\":%.0f,"
+            "\"ch2o\":%.4f,\"co\":%.1f,\"o3\":%.1f,\"no2\":%.1f,"
+            "\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f}"
+            "\n",
+            (long)now,
+            temp, humi,
+            pm1, pm25, pm10,
+            co2, voc,
+            ch2o, co, o3, no2,
+            ax, ay, az
+        );
+        fflush(stdout);
     }
 
     i2cClose(lis3dh_handle);
