@@ -1,0 +1,29 @@
+[Unit]
+Description=Gateway (venv) autostart
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi
+
+# venv 파이썬으로 gateway.py 실행
+ExecStart=/home/pi/venv/bin/python3 /home/pi/gateway.py
+
+# (선택) stdout 로그 즉시 출력
+Environment=PYTHONUNBUFFERED=1
+
+# (선택) .env를 /home/pi/.env로 쓴다면 활성화
+# EnvironmentFile=-/home/pi/.env
+
+Restart=always
+RestartSec=2
+
+User=pi
+Group=pi
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

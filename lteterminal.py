@@ -52,8 +52,7 @@ def at(cmd):
 
 def start_gps_and_read_nmea(duration_s=120):
     ser = serial.Serial(AT_PORT, BAUD, timeout=1)
-    try:
-        # (선택) 관리자모드 필요하면
+    try:        
         # at_send(ser, 'AT!ENTERCND="A710"')
 
         # LTE 상태 먼저 체크(전용 SUPL 안쓸거라도, 망 붙었는지 확인 지표)
@@ -65,8 +64,7 @@ def start_gps_and_read_nmea(duration_s=120):
 
         # Fix 시작
         gps_fix_start(ser, fix_type=2, max_time=duration_s, max_dist=4294967280)
-
-        # 상태 폴링과 동시에 NMEA 수집 (AT 포트에도 $G.. 문장이 흘러나온다)
+        
         start = time.time()
         buf = []
         while time.time() - start < duration_s:
@@ -134,8 +132,8 @@ if __name__ == "__main__":
     #at_send(ser, "AT+CGPADDR=1")
     #at_send(ser, "AT+CEER")
     #at_send(ser, "AT+CGSN")
-#    at_send(ser, "AT+CGDCONT?")
-#    at_send(ser, "AT!GSTATUS?")
+    #at_send(ser, "AT+CGDCONT?")
+    #at_send(ser, "AT!GSTATUS?")
     #at_send(ser, "AT!USBCOMP=?")
     #at_send(ser, "AT!USBCOMP?")
     #at_send(ser, "AT+QGPSLOC?")

@@ -1,11 +1,13 @@
 # node_scheduler.py
 import json
 import time
+import threading
 from datetime import datetime, date, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from astral.sun import sun
 from astral import LocationInfo
+from zoneinfo import ZoneInfo
 
 REGION_TABLE = {
     0: ("Default", 37.5665, 126.9780),   # 기본
@@ -24,12 +26,19 @@ REGION_TABLE = {
     13: ("Jeju", 33.4996, 126.5312),
 }
 
+KST = ZoneInfo("Asia/Seoul")
+CMD_SET_RTC_KST = 0x2B
+RTC_SYNC_BCAST_MID = 0x0000
+RTC_SYNC_PERIOD_MIN = 60
+RTC_SYNC_STARTUP_DELAY_SEC = 0.0
+
 class NodeScheduler:
 
     def __init__(self, wisun_client, config_path: str):
 
         self.wisun = wisun_client
         self.config_path = Path(config_path)
+        self._stop_event = threading.Event()
 
         self.schedules: List[Dict[str, Any]] = []
 
@@ -40,6 +49,13 @@ class NodeScheduler:
                 self._apply_all_schedules()
             except Exception as e:
                 print(f"[SCHED] failed to apply saved schedules on boot: {e}")
+
+        self._rtc_sync_thread = threading.Thread(
+            target=self._rtc_sync_loop,
+            name="node-rtc-sync",
+            daemon=True,
+        )
+        self._rtc_sync_thread.start()
 
     def load_from_file(self) -> None:
         if not self.config_path.exists():
@@ -82,6 +98,9 @@ class NodeScheduler:
 
     def tick(self, now: Optional[datetime] = None) -> None:
         return
+
+    def stop(self) -> None:
+        self._stop_event.set()
 
     def get_snap_period_sec(self) -> Optional[int]:
         periods: List[int] = []
@@ -152,6 +171,72 @@ class NodeScheduler:
                 print(f"[SCHED] applied node_cfg for {name}")
             except Exception as e:
                 print(f"[SCHED] failed to send node_cfg for {name}: {e}")
+
+    def _now_kst(self) -> datetime:
+        return datetime.now(KST)
+
+    def _build_rtc_sync_payload(self, when: Optional[datetime] = None) -> bytes:
+        now = when.astimezone(KST) if when is not None else self._now_kst()
+        year = int(now.year)
+        return bytes([
+            (year >> 8) & 0xFF,
+            year & 0xFF,
+            now.month & 0xFF,
+            now.day & 0xFF,
+            now.hour & 0xFF,
+            now.minute & 0xFF,
+            now.second & 0xFF,
+        ])
+
+    def sync_rtc_kst_broadcast(self, when: Optional[datetime] = None) -> None:
+        now = when.astimezone(KST) if when is not None else self._now_kst()
+        payload = self._build_rtc_sync_payload(now)
+        msg_id = int(now.timestamp()) & 0xFFFF
+        print(f"[RTC SYNC TX] {now.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        self.wisun.send_cmd_bytes(
+            target_mid=RTC_SYNC_BCAST_MID,
+            cmd=CMD_SET_RTC_KST,
+            msg_id=msg_id,
+            flags=0x00,
+            extra=payload,
+        )
+        print(f"[SCHED] broadcast rtc_kst {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+    def _seconds_until_next_rtc_sync(self, now: Optional[datetime] = None) -> float:
+        current = now.astimezone(KST) if now is not None else self._now_kst()
+        target = current.replace(second=0, microsecond=0)
+        next_minute = ((target.minute // RTC_SYNC_PERIOD_MIN) + 1) * RTC_SYNC_PERIOD_MIN
+        if next_minute >= 60:
+            target = (target + timedelta(hours=1)).replace(minute=0)
+        else:
+            target = target.replace(minute=next_minute)
+        return max(1.0, (target - current).total_seconds())
+
+    def _sleep_until_or_stop(self, seconds: float) -> bool:
+        deadline = time.time() + max(0.0, seconds)
+        while not self._stop_event.is_set():
+            remain = deadline - time.time()
+            if remain <= 0:
+                return False
+            time.sleep(min(1.0, remain))
+        return True
+
+    def _rtc_sync_loop(self) -> None:
+        if not self._sleep_until_or_stop(RTC_SYNC_STARTUP_DELAY_SEC):
+            try:
+                self.sync_rtc_kst_broadcast()
+            except Exception as e:
+                print(f"[SCHED] failed to broadcast startup rtc sync: {e}")
+
+        while not self._stop_event.is_set():
+            wait_sec = self._seconds_until_next_rtc_sync()
+            if self._sleep_until_or_stop(wait_sec):
+                return
+            try:
+                self.sync_rtc_kst_broadcast()
+            except Exception as e:
+                print(f"[SCHED] failed to broadcast daily rtc sync: {e}")
 
     def calc_sun_times(self,region_code: int, date: datetime.date):
         name, lat, lon = REGION_TABLE.get(region_code, REGION_TABLE[0])
@@ -269,16 +354,15 @@ class NodeScheduler:
             snap_period_min = max(1, min(255, period_sec // 60))
 
         data = bytearray(9)
-        data[0] = mode & 0xFF
-        data[1] = on_h & 0xFF
-        data[2] = on_m & 0xFF
-        data[3] = off_h & 0xFF
-        data[4] = off_m & 0xFF
-        data[5] = manual_dur_min & 0xFF
-        data[6] = snap_enable & 0xFF
-        data[7] = snap_period_min & 0xFF
-
-        data[8] = 0
+        data[0] = 1  # node firmware expects version first
+        data[1] = mode & 0xFF
+        data[2] = on_h & 0xFF
+        data[3] = on_m & 0xFF
+        data[4] = off_h & 0xFF
+        data[5] = off_m & 0xFF
+        data[6] = manual_dur_min & 0xFF
+        data[7] = snap_enable & 0xFF
+        data[8] = snap_period_min & 0xFF
 
         return bytes(data)
     

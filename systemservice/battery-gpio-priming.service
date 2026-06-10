@@ -1,0 +1,11 @@
+[Unit]
+Description=Prime ADT/BAT EN GPIOs high at boot
+Requires=pigpiod.service
+After=pigpiod.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '/usr/bin/pigs w 22 1; /usr/bin/pigs w 10 1'
+
+[Install]
+WantedBy=multi-user.target

@@ -80,6 +80,7 @@ def main() -> int:
 
         j = extract_json_object(line)
         if not j:
+            print(line.rstrip(), flush=True)
             continue
 
         # multisensor가 찍는 env JSON만 저장 (원하면 이 필터 제거 가능)

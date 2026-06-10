@@ -35,6 +35,10 @@ class NodeStore:
             # 얕은 복사 정도면 충분
             return list(self._by_key.values())
         
+    def pending_nodes(self):
+        with self._lock:
+            return [rec for rec in self._by_key.values() if bool(rec.get("pending_send", 0))]
+
     def _mk_key(self, uid: Optional[str], mid: Optional[int]) -> str:
         """
         uid / mid 조합으로 내부 key 생성.
@@ -170,11 +174,22 @@ class NodeStore:
             voltage: Optional[float] = None,
             current: Optional[float] = None,
             temperature: Optional[float] = None,
+            light_on: Optional[int] = None,
             fft: Optional[Sequence[Sequence[float]]] = None,
             ts: Optional[float] = None,
             *,
             channel: Optional[int] = None,
+            interval: Optional[int] = None,
             mid_assigned: Optional[bool] = None,
+            pending_send: Optional[bool] = None,
+            last_sent_ts: Optional[float] = None,
+            last_snap_ts: Optional[float] = None,
+            ai_valid: Optional[int] = None,
+            ai_mse: Optional[float] = None,
+            ai_pred: Optional[int] = None,
+            last_good_temperature: Optional[float] = None,
+            last_good_fft: Optional[Sequence[Sequence[float]]] = None,
+            last_good_measurement_ts: Optional[float] = None,
         ) -> Dict[str, Any]:
 
         if uid is not None and not self._is_valid_uid(uid):
@@ -200,13 +215,52 @@ class NodeStore:
                 "temperature": (
                     temperature if temperature is not None else old.get("temperature")
                 ),
+                "light_on": (
+                    light_on if light_on is not None else old.get("light_on")
+                ),
                 "fft": fft if fft is not None else old.get("fft"),
                 "ts": now,
                 "channel": (
                     channel if channel is not None else old.get("channel")
                 ),
+                "interval": (
+                    int(interval) if interval is not None else old.get("interval")
+                ),
                 "mid_assigned": (
                     mid_assigned if mid_assigned is not None else old.get("mid_assigned")
+                ),
+                "pending_send": (
+                    int(bool(pending_send)) if pending_send is not None else int(old.get("pending_send", 0))
+                ),
+                "last_sent_ts": (
+                    float(last_sent_ts) if last_sent_ts is not None else old.get("last_sent_ts")
+                ),
+                "last_snap_ts": (
+                    float(last_snap_ts) if last_snap_ts is not None else old.get("last_snap_ts")
+                ),
+                "ai_valid": (
+                    int(ai_valid) if ai_valid is not None else old.get("ai_valid")
+                ),
+                "ai_mse": (
+                    float(ai_mse) if ai_mse is not None else old.get("ai_mse")
+                ),
+                "ai_pred": (
+                    int(ai_pred) if ai_pred is not None else old.get("ai_pred")
+                ),
+                "last_good_temperature": (
+                    last_good_temperature
+                    if last_good_temperature is not None
+                    else old.get("last_good_temperature")
+                ),
+                "last_good_fft": (
+                    last_good_fft
+                    if last_good_fft is not None
+                    else old.get("last_good_fft")
+                ),
+                "last_good_measurement_ts": (
+                    float(last_good_measurement_ts)
+                    if last_good_measurement_ts is not None
+                    else old.get("last_good_measurement_ts")
                 ),
             }
 
@@ -223,6 +277,54 @@ class NodeStore:
 
             self._atomic_save()
             return rec
+
+    def mark_sent_for_mids(self, mids: Sequence[int], sent_ts: Optional[float] = None) -> int:
+        when = sent_ts if sent_ts is not None else time.time()
+        targets = {int(mid) for mid in mids if mid is not None}
+        if not targets:
+            return 0
+
+        updated = 0
+        with self._lock:
+            for rec in self._by_key.values():
+                try:
+                    mid = int(rec.get("mid") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if mid in targets:
+                    rec["pending_send"] = 0
+                    rec["last_sent_ts"] = when
+                    updated += 1
+
+            if updated:
+                self._atomic_save()
+        return updated
+
+    def mark_pending_by_mid(self, mid: int, pending: bool = True) -> int:
+        try:
+            target_mid = int(mid or 0)
+        except (TypeError, ValueError):
+            return 0
+        if target_mid <= 0:
+            return 0
+
+        updated = 0
+        with self._lock:
+            for rec in self._by_key.values():
+                try:
+                    rec_mid = int(rec.get("mid") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if rec_mid != target_mid:
+                    continue
+                new_pending = 1 if pending else 0
+                if int(rec.get("pending_send", 0) or 0) != new_pending:
+                    rec["pending_send"] = new_pending
+                    updated += 1
+
+            if updated:
+                self._atomic_save()
+        return updated
 
     def get_by_uid_mid(self, uid: Optional[str], mid: Optional[int]) -> Optional[Dict[str, Any]]:
         key = self._mk_key(uid, mid)

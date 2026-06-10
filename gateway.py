@@ -7,14 +7,99 @@ from node_scheduler import NodeScheduler
 import threading, time
 from store import NodeStore
 import os
+import subprocess
 from gps_reader import start_gps_thread
 from logger.logger import setup_logger
 
-GID = "gw001" 
+DEFAULT_GID = "gw001"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_DIR = os.path.join(BASE_DIR, "config")
+
+
+def load_gateway_id(path=None, default=DEFAULT_GID):
+    cfg_path = path or os.path.join(CONFIG_DIR, "gw_id.conf")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            gid = f.read().strip()
+    except FileNotFoundError:
+        return default
+    except Exception:
+        return default
+
+    return gid or default
+
+BOOT_CHECK_SERVICES = (
+    "pigpiod.service",
+    "battery-gpio-priming.service",
+    "battery_backup.service",
+    "multisensor_publisher.service",
+)
+
+
+def _systemctl_state(service_name):
+    try:
+        active = subprocess.run(
+            ["systemctl", "is-active", service_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        failed = subprocess.run(
+            ["systemctl", "is-failed", service_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return active.stdout.strip(), failed.stdout.strip()
+    except Exception as e:
+        return "unknown", f"check_error:{e}"
+
+
+def _service_boot_ok(service_name):
+    active, failed = _systemctl_state(service_name)
+    if failed == "failed":
+        return False, active, failed
+    if service_name == "battery-gpio-priming.service":
+        return failed in ("active", "inactive"), active, failed
+    return active == "active", active, failed
+
+
+def publish_boot_success(mqtt, gid, log):
+    failed_services = []
+    service_states = {}
+    for service_name in BOOT_CHECK_SERVICES:
+        ok, active, failed = _service_boot_ok(service_name)
+        service_states[service_name] = {
+            "ok": bool(ok),
+            "active": active,
+            "failed": failed,
+        }
+        log.info(
+            "boot service check service=%s ok=%s active=%s failed=%s",
+            service_name,
+            ok,
+            active,
+            failed,
+        )
+        if not ok:
+            failed_services.append(service_name)
+
+    boot_stats = 0 if failed_services else 1
+    topic = f"gw/{gid}/boot_success"
+    payload = {"boot_stats": boot_stats}
+    if failed_services:
+        payload["failed_services"] = failed_services
+        payload["service_states"] = service_states
+    mqtt.publish_json(topic, payload)
+    log.info("boot_success publish topic=%s payload=%s failed_services=%s", topic, payload, failed_services)
+    print(f"[BOOT] publish {topic} {payload} failed_services={failed_services}", flush=True)
 
 def main():
-    cfg_dir = "config"
+    cfg_dir = CONFIG_DIR
     os.makedirs(cfg_dir, exist_ok=True)
+    gid = load_gateway_id(os.path.join(cfg_dir, "gw_id.conf"))
 
     log = setup_logger(
         name="gw",
@@ -27,7 +112,7 @@ def main():
         enable_raw=False,
     )
 
-    log.info("gateway boot gid=%s cfg_dir=%s", GID, cfg_dir)
+    log.info("gateway boot gid=%s cfg_dir=%s", gid, cfg_dir)
     def pump_wisun(wisun, router, log):
         drained = 0
         while True:
@@ -77,12 +162,12 @@ def main():
             config_path="config/node_schedule.config"
         )
 
-        log.info("init mqtt client host=%s port=%d client_id=%s", "mqtt.hananet.co.kr", 8883, GID)
-        mqtt = MqttBridge(host="mqtt.hananet.co.kr", port=8883, client_id=GID, username=GID, scheduler=scheduler)
-        mqtt.configure_tls_min12_from("/etc/mosquitto/certs", GID)
+        log.info("init mqtt client host=%s port=%d client_id=%s", "mqtt.hananet.co.kr", 8883, gid)
+        mqtt = MqttBridge(host="mqtt.hananet.co.kr", port=8883, client_id=gid, username=gid, scheduler=scheduler)
+        mqtt.configure_tls_min12_from("/etc/mosquitto/certs", gid)
 
         reg = NodeRegistry()
-        router = CmdRouter(wisun, mqtt, reg, attach_raw_bytes=True, gwid=GID, store=store, scheduler=scheduler)
+        router = CmdRouter(wisun, mqtt, reg, attach_raw_bytes=True, gwid=gid, store=store, scheduler=scheduler)
 
         mqtt.set_router(router)
 
@@ -93,6 +178,10 @@ def main():
         log.info("mqtt connected, loop_start()")
 
         mqtt.loop_start()
+
+        if not mqtt.wait_connected(timeout=10):
+            log.warning("mqtt connect ack timeout before boot_success publish")
+        publish_boot_success(mqtt, gid, log)
         
         log.info("main loop start")
 

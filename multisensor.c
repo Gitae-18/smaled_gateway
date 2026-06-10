@@ -28,6 +28,14 @@
 #define I2C_BUS 1
 int lis3dh_handle = -1;
 
+static void print_sensor_frame(const unsigned char *buf, size_t len) {
+    printf("[ENV RAW]");
+    for (size_t i = 0; i < len; ++i) {
+        printf(" %02X", buf[i]);
+    }
+    printf("\n");
+}
+
 void init_lis3dhtr() {
     lis3dh_handle = i2cOpen(I2C_BUS, LIS3DH_I2C_ADDR, 0);
     if (lis3dh_handle < 0) {
@@ -96,6 +104,8 @@ int main() {
             receivedSensor[i] = serReadByte(h2s_fd);
         }
 
+        print_sensor_frame(dataFromSensor, sizeof(dataFromSensor));
+
         double temp = ((dataFromSensor[11] * 256 + dataFromSensor[12]) - 500) * 0.1;
         double humi = dataFromSensor[13] * 256 + dataFromSensor[14];
         double pm25 = (dataFromSensor[4] * 256 + dataFromSensor[5]) / 10.0;
@@ -105,11 +115,15 @@ int main() {
         double voc  = dataFromSensor[10];
         double ch2o = (dataFromSensor[15] * 256 + dataFromSensor[16]) * 0.0001 / 10.0;
         double co   = (dataFromSensor[17] * 256 + dataFromSensor[18]) * 0.1;
-        double o3   = (dataFromSensor[19] * 256 + dataFromSensor[20]) * 0.1;
-        double no2  = (dataFromSensor[21] * 256 + dataFromSensor[22]) * 0.1;
+        double o3   = (dataFromSensor[19] * 256 + dataFromSensor[20]) * 0.01;
+        double no2  = (dataFromSensor[21] * 256 + dataFromSensor[22]) * 0.01;
 //        double h2s  = (receivedSensor[2] * 256 + receivedSensor[3]) / 10.0;
 
-        
+        printf(
+            "[ENV GAS RAW] O3_H=%u O3_L=%u O3=%.2f ppm, NO2_H=%u NO2_L=%u NO2=%.2f ppm\n",
+            dataFromSensor[19], dataFromSensor[20], o3,
+            dataFromSensor[21], dataFromSensor[22], no2
+        );
 
         printf("[ENV] Temp: %.2f\u00b0C, Humi: %.2f%%, PM2.5: %.2f, CO2: %.0f\n",
                temp, humi, pm25, co2);
@@ -123,7 +137,7 @@ int main() {
             "\"temp\":%.2f,\"humi\":%.2f,"
             "\"pm1\":%.2f,\"pm25\":%.2f,\"pm10\":%.2f,"
             "\"co2\":%.0f,\"voc\":%.0f,"
-            "\"ch2o\":%.4f,\"co\":%.1f,\"o3\":%.1f,\"no2\":%.1f,"
+            "\"ch2o\":%.4f,\"co\":%.1f,\"o3\":%.2f,\"no2\":%.2f,"
             "\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f}"
             "\n",
             (long)now,

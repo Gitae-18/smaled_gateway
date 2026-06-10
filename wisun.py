@@ -85,6 +85,7 @@ class WiSunLink:
         self._at_q = queue.Queue(maxsize=200)
         self._at_lock = threading.Lock()
         self._at_text_buf = ""
+        self._frame_error_handlers = []
         self.log = logging.getLogger("gw")
         self.log.info("WiSunLink init port=%s baud=%d", self.port, self.baudrate)
     # ───────────────── TX ─────────────────
@@ -189,6 +190,27 @@ class WiSunLink:
         return self.send_wisun_packet(mid, payload)
 
     # ───────────────── RX pull API ─────────────────
+
+    def add_frame_error_handler(self, fn):
+        if callable(fn):
+            self._frame_error_handlers.append(fn)
+
+    def _emit_frame_error(self, kind: str, *, frame: bytes | None = None,
+                          mid: int | None = None, detail: str | None = None):
+        ts = self._get_timestamp()
+        payload_hex = frame.hex(" ") if isinstance(frame, (bytes, bytearray)) else None
+        event = {
+            "kind": kind,
+            "mid": mid,
+            "ts": ts,
+            "detail": detail,
+            "payload_hex": payload_hex,
+        }
+        for fn in list(self._frame_error_handlers):
+            try:
+                fn(event)
+            except Exception as e:
+                self.log.warning("wisun frame error handler failed err=%r event=%r", e, event)
 
     def get_packet_nowait(self) -> Optional[Tuple[int, Union[dict, bytes], int, Optional[str]]]:
         try:
@@ -446,7 +468,7 @@ class WiSunLink:
 
     def _decode_payload(self, data_bytes: bytes, mid: int, mac_str: str, rxp: int, ts: int) -> Union[dict, bytes]:
         print(f"[WISUN DECODE IN] len={len(data_bytes)} t=0x{data_bytes[0]:02X} head={data_bytes[:16].hex(' ')}")
-        if data_bytes and data_bytes[0] in (0x10, 0x01, 0x02, 0x24, 0x40):
+        if data_bytes and data_bytes[0] in (0x10, 0x01, 0x02, 0x15, 0x24, 0x40):
             return data_bytes
     
         if data_bytes and len(data_bytes) >= ACK_BIN_SIZE and data_bytes[0] == ACK_T:
@@ -591,12 +613,19 @@ class WiSunLink:
 
             frame = bytes(buf[:expected_len])
             del buf[:expected_len]
+            frame_mid = (frame[4] | (frame[5] << 8)) if len(frame) >= 6 else None
 
             # 4) ETX 검사 실패 시 재동기화 (핵심)
             if frame[-1] != ETX:
                 print(f"[GW] invalid ETX: {frame[-1]:02X}, drop frame")
                 self.log.warning("wisun drop invalid etx got=%02X expected=%02X frame_len=%d",
-                     frame[-1], ETX, len(frame))                
+                     frame[-1], ETX, len(frame))
+                self._emit_frame_error(
+                    "invalid_etx",
+                    frame=frame,
+                    mid=frame_mid,
+                    detail=f"got={frame[-1]:02X} expected={ETX:02X}",
+                )
                 j = frame[1:].find(bytes([STX]))
                 if j >= 0:
                     buf[:0] = frame[1 + j:]
@@ -617,6 +646,12 @@ class WiSunLink:
                 print(f"[GW] CK mismatch drop: got={ck_got:02X} exp={ck_exp:02X} len={len(frame)}")
                 self.log.warning("wisun drop ck mismatch got=%02X exp=%02X frame_len=%d",
                                  ck_got, ck_exp, len(frame))
+                self._emit_frame_error(
+                    "ck_mismatch",
+                    frame=frame,
+                    mid=frame_mid,
+                    detail=f"got={ck_got:02X} expected={ck_exp:02X}",
+                )
 
                 # 재동기화: frame 내부 다음 STX 찾아서 되돌리기
                 j = frame[1:].find(bytes([STX]))
@@ -635,10 +670,24 @@ class WiSunLink:
                 data_field = frame[6:-2]
             print("[UART RX FRAME]", frame.hex(" "))
             print("[UART RX PAYLOAD]", data_field.hex(" "))
+            frame_data_hex = frame[16:-2].hex(" ") if sig2 == 0xAA else frame[6:-2].hex(" ")
+            data_head_hex = data_field[:16].hex(" ")
+            data_tail_hex = data_field[-22:].hex(" ") if len(data_field) >= 22 else data_field.hex(" ")
+            print(
+                f"[UART RX DATA CHECK] mid={mid} declared_dl={declared_dl} actual_dl={len(data_field)} "
+                f"frame_data_hex={frame_data_hex} data_head_hex={data_head_hex} data_tail_hex={data_tail_hex}",
+                flush=True,
+            )
             if len(data_field) != declared_dl:
                 print(f"[GW] LEN mismatch: LEN={declared_dl} data={len(data_field)} drop")
                 self.log.warning("wisun drop len mismatch declared=%d actual=%d",
                      declared_dl, len(data_field))
+                self._emit_frame_error(
+                    "len_mismatch",
+                    frame=frame,
+                    mid=mid,
+                    detail=f"declared={declared_dl} actual={len(data_field)}",
+                )
                 #buf[:0] = frame[1:]
                 nxt = frame[1:].find(bytes([STX]))
                 if nxt >= 0:

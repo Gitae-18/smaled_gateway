@@ -2,7 +2,7 @@
 import time
 
 class NodeRegistry:
-    def __init__(self, ttl_sec: int = 120):
+    def __init__(self, ttl_sec: int = 300):
         self.ttl = ttl_sec
         self._last_seen = {}   # mid -> ts
         self._meta = {}        # mid -> dict (선택: rssi, fw, etc.)

@@ -1,0 +1,19 @@
+[Unit]
+Description=Multisensor publisher (ENV cache + MQTT publish helper)
+After=network-online.target pigpiod.service
+Wants=network-online.target pigpiod.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi
+ExecStart=/home/pi/venv/bin/python3 /home/pi/multisensor_publisher.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

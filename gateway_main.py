@@ -23,11 +23,6 @@ def on_mqtt_message(client, userdata, msg):
         print("[MQTT] JSON decode error:", e)
         return
 
-    # 예: data 안에 {"target":"node", "cmd":"light_on", ...} 이런 식으로 온다고 가정
-    # Wi-SUN으로 넘기거나, CmdRouter에 넘기기
-    # router.handle(data) 같은 식으로
-    # router.handle_cmd(data)  # 너가 정의한 함수에 맞게 호출
-
 def main():
     # 1) NodeStore / Wi-SUN / Router 준비
     store = NodeStore(path="nodes_store.cbor", cap=20)

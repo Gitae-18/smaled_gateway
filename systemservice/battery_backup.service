@@ -1,0 +1,17 @@
+[Unit]
+Description=Battery backup watcher
+Wants=battery-gpio-priming.service
+Requires=pigpiod.service
+After=pigpiod.service battery-gpio-priming.service
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi
+Environment=GPIOZERO_PIN_FACTORY=pigpio
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pi/venv/bin/python -u /home/pi/battery_backup.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
