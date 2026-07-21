@@ -9,6 +9,11 @@ import string
 import os
 import math
 from collections import defaultdict, deque
+try:
+    from node_scheduler import build_rtc_kst_payload_with_sun_minutes, _read_gateway_gps
+except Exception:
+    build_rtc_kst_payload_with_sun_minutes = None
+    _read_gateway_gps = None
 
 CMD_ROUTER_VERBOSE_LOG = False
 
@@ -33,10 +38,11 @@ CMD_SET_POWER = 0x28
 CMD_SET_NODE_INFO      = 0x29
 CMD_SET_TIME_INTERVAL  = 0x2A
 CMD_SET_RTC_KST        = 0x2B
+CMD_SET_ASTRO_SETTING  = 0x45
 
 T_SNAP = 0x01
 T_LIGHT_STATE_EVENT = 0x15
-LIGHT_STATE_EVENT_BIN_FMT = "<B12sIBBBBIfffBffff"
+LIGHT_STATE_EVENT_BIN_FMT = "<B12sIBBBBIfffBIiIi"
 LIGHT_STATE_EVENT_BIN_SIZE = struct.calcsize(LIGHT_STATE_EVENT_BIN_FMT)
 LIGHT_STATE_EVENT_RTC_EXT_FMT = "<HBBBBBB"
 LIGHT_STATE_EVENT_RTC_EXT_SIZE = struct.calcsize(LIGHT_STATE_EVENT_RTC_EXT_FMT)
@@ -46,14 +52,29 @@ SNAP_FFT_PAIRS = 2
 # fft0{uint32 freq_hz_x100, int32 amp_x1000},
 # snap_count, ai_mse_x1000000, flags
 SNAP_AI_MSE_SCALE = 1_000_000.0
-SNAP_BIN_FMT = "<BB12sfffBIiHHB"
+""" SNAP_BIN_FMT = "<BB12sfffBIiHHB"
 SNAP_BIN_SIZE = struct.calcsize(SNAP_BIN_FMT)
-SNAP_POST_FREQ0_OFFSET = struct.calcsize("<BB12sfffBI")
+SNAP_POST_FREQ0_OFFSET = struct.calcsize("<BB12sfffBI") """
+SNAP_BIN_FMT_NO_TTL = "<B12sfffBIiHHB"
+SNAP_BIN_SIZE_NO_TTL = struct.calcsize(SNAP_BIN_FMT_NO_TTL)
+
+SNAP_BIN_FMT_TTL = "<BB12sfffBIiHHB"
+SNAP_BIN_SIZE_TTL = struct.calcsize(SNAP_BIN_FMT_TTL)
+
+# 기존 코드 호환용: 최소 SNAP 길이는 no-ttl 기준
+SNAP_BIN_FMT = SNAP_BIN_FMT_NO_TTL
+SNAP_BIN_SIZE = SNAP_BIN_SIZE_NO_TTL
+SNAP_POST_FREQ0_OFFSET = struct.calcsize("<B12sfffBI")
 
 ACK_T = 0x10
 ACK_NODE_CFG_T = 0x20
 ACK_BIN_FMT = "<B12sIBb"
 ACK_BIN_SIZE = struct.calcsize(ACK_BIN_FMT)
+SET_SETTING_ACK_V2_FMT = "<B12sIBbBBiiHHHHHH"
+SET_SETTING_ACK_V2_SIZE = struct.calcsize(SET_SETTING_ACK_V2_FMT)
+
+SNAP_COMPACT_V2_FMT = "<BB12sfffBIIHHBBHH"
+SNAP_COMPACT_V2_SIZE = struct.calcsize(SNAP_COMPACT_V2_FMT)
 
 STATUS_T = 0x02
 STATUS_BIN_FMT_V1 = "<B12sfffBIBb"
@@ -139,6 +160,54 @@ def _extract_gps_values(latest: dict) -> dict:
             gps_values[k] = gps[k]
     return gps_values
 
+def _gateway_mqtt_status(mqtt) -> dict:
+    connected = None
+    try:
+        ev = getattr(mqtt, "_connected_event", None)
+        if ev is not None and hasattr(ev, "is_set"):
+            connected = bool(ev.is_set())
+    except Exception:
+        connected = None
+
+    net_link_up = None
+    try:
+        if mqtt is not None and hasattr(mqtt, "_read_net_link_up"):
+            net_link_up = mqtt._read_net_link_up()
+    except Exception:
+        net_link_up = None
+
+    online = bool(connected) if connected is not None else True
+    status = "online" if online else "offline"
+    return {
+        "status": status,
+        "online": online,
+        "mqtt_connected": connected,
+        "net_link_up": net_link_up,
+    }
+
+def _gateway_gnss_status(gps_values: dict, now_ts: int, max_age_sec: int = 600) -> dict:
+    lat = gps_values.get("lat") if isinstance(gps_values, dict) else None
+    lon = gps_values.get("lon") if isinstance(gps_values, dict) else None
+    gps_ts = gps_values.get("ts") if isinstance(gps_values, dict) else None
+
+    has_fix = lat is not None and lon is not None
+    age_sec = None
+    try:
+        if gps_ts is not None:
+            age_sec = max(0, int(now_ts) - int(gps_ts))
+    except Exception:
+        age_sec = None
+
+    fresh = age_sec is None or age_sec <= int(max_age_sec)
+    lock = bool(has_fix and fresh)
+    return {
+        "lock": lock,
+        "status": "normal" if lock else "no_fix",
+        "status_text": "정상" if lock else "-",
+        "age_sec": age_sec,
+        "ts": gps_ts,
+    }
+
 def _looks_like_text_payload(b: bytes) -> bool:
     if not b:
         return False
@@ -211,7 +280,7 @@ def _is_plausible_snap(parsed: dict) -> bool:
 
     return True
 
-def unpack_snap_bin(b: bytes):
+""" def unpack_snap_bin(b: bytes):
     if len(b) < SNAP_BIN_SIZE or b[0] != T_SNAP:
         return None
 
@@ -271,6 +340,137 @@ def unpack_snap_bin(b: bytes):
             "a1_x1000": int(a1_x1000),
         },
     })
+    if _is_plausible_snap(scaled):
+        return scaled
+
+    return None """
+
+def unpack_snap_bin(b: bytes):
+    if not isinstance(b, (bytes, bytearray)) or len(b) < SNAP_BIN_SIZE_NO_TTL:
+        return None
+    if b[0] != T_SNAP:
+        return None
+
+    # 45 bytes: compact V2 + control_mode/on_time_min/off_time_min
+    # 40 bytes: compact V1
+    # 39 bytes: version + uid12 + values...
+    try:
+        if len(b) >= SNAP_COMPACT_V2_SIZE:
+            (
+                t_val,
+                ttl,
+                uid_bytes,
+                volt,
+                curr,
+                temp,
+                light_on,
+                f1_x100,
+                a1_x1000,
+                snap_count,
+                ai_mse_x1000000,
+                flags,
+                control_mode,
+                on_time_min,
+                off_time_min,
+            ) = struct.unpack(SNAP_COMPACT_V2_FMT, b[:SNAP_COMPACT_V2_SIZE])
+
+            layout = "snap_45b_compact_v2_ttl_scaled_fft_ai_schedule"
+            tail_valid = True
+
+        elif len(b) >= SNAP_BIN_SIZE_TTL:
+            (
+                t_val,
+                ttl,
+                uid_bytes,
+                volt,
+                curr,
+                temp,
+                light_on,
+                f1_x100,
+                a1_x1000,
+                snap_count,
+                ai_mse_x1000000,
+                flags,
+            ) = struct.unpack(SNAP_BIN_FMT_TTL, b[:SNAP_BIN_SIZE_TTL])
+
+            layout = "snap_40b_compact_ttl_scaled_fft_ai"
+            tail_valid = True
+            control_mode = None
+            on_time_min = None
+            off_time_min = None
+
+        else:
+            (
+                t_val,
+                uid_bytes,
+                volt,
+                curr,
+                temp,
+                light_on,
+                f1_x100,
+                a1_x1000,
+                snap_count,
+                ai_mse_x1000000,
+                flags,
+            ) = struct.unpack(SNAP_BIN_FMT_NO_TTL, b[:SNAP_BIN_SIZE_NO_TTL])
+
+            ttl = None
+            layout = "snap_39b_compact_no_ttl_scaled_fft_ai"
+            tail_valid = True
+            control_mode = None
+            on_time_min = None
+            off_time_min = None
+
+    except struct.error:
+        return None
+
+    if len(b) >= SNAP_COMPACT_V2_SIZE:
+        fft_valid = int(flags) & 0x01
+        ai_valid = (int(flags) >> 1) & 0x01
+        ai_pred = (int(flags) >> 2) & 0x01
+        ok = (int(flags) >> 7) & 0x01
+    else:
+        # Legacy compact firmware flag mapping.
+        fft_valid = 1 if int(f1_x100) > 0 else 0
+        ai_valid = int(flags) & 0x01
+        ai_pred = (int(flags) >> 1) & 0x01
+        ok = (int(flags) >> 2) & 0x01
+    err_code = 0 if ok else 1
+
+    scaled = {
+        "t": int(t_val),
+        "ttl": None if ttl is None else int(ttl),
+        "uid_bytes": uid_bytes,
+        "volt": round(float(volt), 4),
+        "curr": round(float(curr), 4),
+        "temp": round(float(temp), 4),
+        "light_on": int(light_on),
+        "fft_count": 1 if fft_valid else 0,
+        "snap_count": int(snap_count),
+        "msg_id32": int(snap_count),
+        "ok": int(ok),
+        "err_code": int(err_code),
+        "ai_valid": int(ai_valid),
+        "ai_mse": float(ai_mse_x1000000) / SNAP_AI_MSE_SCALE,
+        "ai_pred": int(ai_pred),
+        "flags": int(flags),
+        "control_mode": None if control_mode is None else int(control_mode),
+        "on_time_min": None if on_time_min is None or int(on_time_min) == 0xFFFF else int(on_time_min),
+        "off_time_min": None if off_time_min is None or int(off_time_min) == 0xFFFF else int(off_time_min),
+        "ai_raw": {
+            "mse_x1000000": int(ai_mse_x1000000),
+        },
+        "tail_valid": tail_valid,
+        "fft_pairs": [
+            (float(f1_x100) / 100.0, float(a1_x1000) / 1000.0),
+        ],
+        "layout": layout,
+        "fft_raw": {
+            "f1_x100": int(f1_x100),
+            "a1_x1000": int(a1_x1000),
+        },
+    }
+
     if _is_plausible_snap(scaled):
         return scaled
 
@@ -383,6 +583,9 @@ def _light_event_measure_score(temp, fft_count, fft_pairs, rtc_parts, valid_flag
     elif valid_temp:
         score -= 5
 
+    if valid_temp and temp_ok and abs(float(temp)) < NODE_ZERO_EPS:
+        score -= 8
+
     try:
         count = int(fft_count)
     except (TypeError, ValueError):
@@ -406,7 +609,7 @@ def _light_event_measure_score(temp, fft_count, fft_pairs, rtc_parts, valid_flag
     if valid_fft and count > 0:
         score += 2
     elif valid_fft and count == 0:
-        score -= 2
+        score -= 10
 
     if rtc_parts and _plausible_light_event_rtc(rtc_parts):
         score += 4
@@ -429,14 +632,17 @@ def _resync_light_event_measurements(b: bytes, valid_flags: int, current: dict):
             temp = struct.unpack_from("<f", b, temp_off)[0]
             fft_count_raw = int(b[temp_off + 4])
             fft_count = max(0, min(SNAP_FFT_PAIRS, fft_count_raw))
-            f1, a1, f2, a2 = struct.unpack_from("<ffff", b, fft_base)
+            f1_x100, a1_x1000, f2_x100, a2_x1000 = struct.unpack_from("<IiIi", b, fft_base)
         except struct.error:
             continue
 
         rtc_off = fft_base + (SNAP_FFT_PAIRS * 8)
         rtc = _read_light_event_rtc_at(b, rtc_off)
         rtc_parts = rtc[0] if rtc else None
-        pairs = [(float(f1), float(a1)), (float(f2), float(a2))]
+        pairs = [
+            (float(int(f1_x100)) / 100.0, float(int(a1_x1000)) / 1000.0),
+            (float(int(f2_x100)) / 100.0, float(int(a2_x1000)) / 1000.0),
+        ]
         score = _light_event_measure_score(temp, fft_count_raw, pairs, rtc_parts, valid_flags)
         candidate = {
             "score": score,
@@ -445,6 +651,12 @@ def _resync_light_event_measurements(b: bytes, valid_flags: int, current: dict):
             "fft_count": fft_count,
             "fft_count_raw": fft_count_raw,
             "fft_pairs": pairs[:fft_count],
+            "fft_raw": {
+                "f1_x100": int(f1_x100),
+                "a1_x1000": int(a1_x1000),
+                "f2_x100": int(f2_x100),
+                "a2_x1000": int(a2_x1000),
+            },
             "rtc": rtc,
         }
         if best is None or candidate["score"] > best["score"]:
@@ -454,49 +666,60 @@ def _resync_light_event_measurements(b: bytes, valid_flags: int, current: dict):
         return None
     return best
 
-def unpack_light_state_event_bin(b: bytes):
-    if len(b) < LIGHT_STATE_EVENT_BIN_SIZE or b[0] != T_LIGHT_STATE_EVENT:
+def _unpack_light_state_event_candidate(b: bytes, layout: str, offsets: dict):
+    try:
+        if offsets["a2"] + 4 > len(b):
+            return None
+        t_val = int(b[0])
+        uid_bytes = bytes(b[1:13])
+        event_id = struct.unpack_from("<I", b, offsets["event_id"])[0]
+        valid_flags = int(b[offsets["valid_flags"]]) & 0xFF
+        light_on = int(b[offsets["light_on"]]) & 0x01
+        mode = int(b[offsets["mode"]])
+        reason = int(b[offsets["reason"]])
+        tick_ms = struct.unpack_from("<I", b, offsets["tick_ms"])[0]
+        voltage = struct.unpack_from("<f", b, offsets["voltage"])[0]
+        current = struct.unpack_from("<f", b, offsets["current"])[0]
+        temp = struct.unpack_from("<f", b, offsets["temp"])[0]
+        fft_count_raw = int(b[offsets["fft_count"]])
+        fft_count = max(0, min(SNAP_FFT_PAIRS, fft_count_raw))
+        f1_x100 = struct.unpack_from("<I", b, offsets["f1"])[0]
+        a1_x1000 = struct.unpack_from("<i", b, offsets["a1"])[0]
+        f2_x100 = struct.unpack_from("<I", b, offsets["f2"])[0]
+        a2_x1000 = struct.unpack_from("<i", b, offsets["a2"])[0]
+    except (IndexError, struct.error):
         return None
 
-    (
-        t_val,
-        uid_bytes,
-        event_id,
-        valid_flags,
-        light_on,
-        mode,
-        reason,
-        tick_ms,
-        voltage,
-        current,
-        temp,
-        fft_count,
-        f1, a1,
-        f2, a2,
-    ) = struct.unpack(LIGHT_STATE_EVENT_BIN_FMT, b[:LIGHT_STATE_EVENT_BIN_SIZE])
-
-    valid_flags = int(valid_flags) & 0xFF
-    fft_count = max(0, min(SNAP_FFT_PAIRS, int(fft_count)))
-    fft_pairs = [(float(f1), float(a1)), (float(f2), float(a2))]
+    fft_pairs = [
+        (float(int(f1_x100)) / 100.0, float(int(a1_x1000)) / 1000.0),
+        (float(int(f2_x100)) / 100.0, float(int(a2_x1000)) / 1000.0),
+    ]
 
     result = {
-        "t": int(t_val),
+        "t": t_val,
         "uid_bytes": uid_bytes,
         "event_id": int(event_id),
         "valid_flags": valid_flags,
-        "light_on": int(light_on) & 0x01,
-        "mode": int(mode),
-        "reason": int(reason),
+        "light_on": light_on,
+        "mode": mode,
+        "reason": reason,
         "tick_ms": int(tick_ms),
         "voltage": float(voltage),
         "current": float(current),
         "temp": float(temp),
         "fft_count": fft_count,
+        "fft_count_raw": fft_count_raw,
         "fft_pairs": fft_pairs[:fft_count],
-        "parse_layout": "normal",
+        "parse_layout": layout,
+        "fft_raw": {
+            "f1_x100": int(f1_x100),
+            "a1_x1000": int(a1_x1000),
+            "f2_x100": int(f2_x100),
+            "a2_x1000": int(a2_x1000),
+        },
     }
 
-    rtc = _read_light_event_rtc_at(b, LIGHT_STATE_EVENT_BIN_SIZE)
+    rtc = _read_light_event_rtc_at(b, offsets["rtc"])
     if rtc:
         (rtc_year, rtc_month, rtc_day, rtc_hour, rtc_min, rtc_sec, rtc_synced), _, rtc_layout = rtc
         result.update({
@@ -514,7 +737,7 @@ def unpack_light_state_event_bin(b: bytes):
             ),
         })
 
-    current_score = _light_event_measure_score(
+    score = _light_event_measure_score(
         result["temp"],
         result["fft_count"],
         fft_pairs,
@@ -529,36 +752,121 @@ def unpack_light_state_event_bin(b: bytes):
         ) if "rtc_year" in result else None,
         valid_flags,
     )
-    alt = _resync_light_event_measurements(b, valid_flags, {"score": current_score})
-    if alt is not None:
-        result.update({
-            "temp": alt["temp"],
-            "fft_count": alt["fft_count"],
-            "fft_pairs": alt["fft_pairs"],
-            "parse_layout": f"resync_shift_{alt['shift']}",
-            "parse_score": alt["score"],
-            "fft_count_raw": alt["fft_count_raw"],
-        })
-        if alt.get("rtc"):
-            (rtc_year, rtc_month, rtc_day, rtc_hour, rtc_min, rtc_sec, rtc_synced), _, rtc_layout = alt["rtc"]
-            result.update({
-                "rtc_year": int(rtc_year),
-                "rtc_month": int(rtc_month),
-                "rtc_day": int(rtc_day),
-                "rtc_hour": int(rtc_hour),
-                "rtc_min": int(rtc_min),
-                "rtc_sec": int(rtc_sec),
-                "rtc_synced": int(rtc_synced) & 0x01,
-                "rtc_layout": rtc_layout,
-                "rtc": (
-                    f"{int(rtc_year):04d}-{int(rtc_month):02d}-{int(rtc_day):02d} "
-                    f"{int(rtc_hour):02d}:{int(rtc_min):02d}:{int(rtc_sec):02d}"
-                ),
-            })
-    else:
-        result["parse_score"] = current_score
 
+    valid_vi = bool(valid_flags & 0x02)
+    if valid_flags & ~0x1F:
+        score -= 8
+    score += bin(valid_flags & 0x1F).count("1") * 5
+    if valid_flags == 0x1F:
+        score += 5
+    if valid_vi:
+        if (
+            _plausible_light_event_number(voltage, 0.0, 100.0) is not None
+            and _plausible_light_event_number(current, 0.0, 50.0) is not None
+        ):
+            score += 6
+        else:
+            score -= 8
+    if light_on in (0, 1):
+        score += 1
+    if 0 <= mode <= 10:
+        score += 1
+    if 0 <= reason <= 32:
+        score += 1
+
+    result["parse_score"] = score
+    result["parse_offsets"] = offsets
     return result
+
+
+def _light_event_measurements_usable(event: dict) -> bool:
+    valid_flags = int(event.get("valid_flags", 0) or 0)
+    valid_temp = bool(valid_flags & 0x04)
+    valid_fft = bool(valid_flags & 0x08)
+
+    if valid_temp:
+        temp = _bounded_number(event.get("temp"), "temperature")
+        if temp is None or abs(float(temp)) < NODE_ZERO_EPS:
+            return False
+
+    if valid_fft:
+        try:
+            fft_count_raw = int(event.get("fft_count_raw", event.get("fft_count", 0)) or 0)
+        except (TypeError, ValueError):
+            return False
+        if fft_count_raw <= 0:
+            return False
+        if _fft_missing_value(event.get("fft_pairs")):
+            return False
+
+    return True
+
+
+def unpack_light_state_event_bin(b: bytes):
+    if len(b) < LIGHT_STATE_EVENT_BIN_SIZE or b[0] != T_LIGHT_STATE_EVENT:
+        return None
+
+    candidates = [
+        (
+            "packed_scaled_fft_i32",
+            {
+                "event_id": 13, "valid_flags": 17, "light_on": 18, "mode": 19,
+                "reason": 20, "tick_ms": 21, "voltage": 25, "current": 29,
+                "temp": 33, "fft_count": 37, "f1": 38, "a1": 42,
+                "f2": 46, "a2": 50, "rtc": 54,
+            },
+        ),
+        (
+            "packed_fft_u32_aligned",
+            {
+                "event_id": 13, "valid_flags": 17, "light_on": 18, "mode": 19,
+                "reason": 20, "tick_ms": 21, "voltage": 25, "current": 29,
+                "temp": 33, "fft_count": 37, "f1": 40, "a1": 44,
+                "f2": 48, "a2": 52, "rtc": 56,
+            },
+        ),
+        (
+            "temp_pad_1_scaled_fft_i32",
+            {
+                "event_id": 13, "valid_flags": 17, "light_on": 18, "mode": 19,
+                "reason": 20, "tick_ms": 21, "voltage": 25, "current": 29,
+                "temp": 34, "fft_count": 38, "f1": 39, "a1": 43,
+                "f2": 47, "a2": 51, "rtc": 55,
+            },
+        ),
+        (
+            "temp_pad_1_fft_u32_aligned",
+            {
+                "event_id": 13, "valid_flags": 17, "light_on": 18, "mode": 19,
+                "reason": 20, "tick_ms": 21, "voltage": 25, "current": 29,
+                "temp": 34, "fft_count": 38, "f1": 40, "a1": 44,
+                "f2": 48, "a2": 52, "rtc": 56,
+            },
+        ),
+        (
+            "c_aligned_scaled_fft_i32",
+            {
+                "event_id": 16, "valid_flags": 20, "light_on": 21, "mode": 22,
+                "reason": 23, "tick_ms": 24, "voltage": 28, "current": 32,
+                "temp": 36, "fft_count": 40, "f1": 44, "a1": 48,
+                "f2": 52, "a2": 56, "rtc": 60,
+            },
+        ),
+    ]
+
+    parsed = []
+    for layout, offsets in candidates:
+        candidate = _unpack_light_state_event_candidate(b, layout, offsets)
+        if candidate is not None:
+            parsed.append(candidate)
+    if not parsed:
+        return None
+
+    best = max(parsed, key=lambda item: item.get("parse_score", -1000))
+    if best.get("parse_score", -1000) < -20:
+        return None
+
+    return best
      
 def cut_cfg_text(payload: bytes) -> bytes:
     # 1) 가장 확실한 종료: ":<ETX>"
@@ -656,15 +964,26 @@ def _sanitize_fft(fft):
     for pair in fft:
         if not isinstance(pair, (list, tuple)) or len(pair) < 1:
             continue
+
         freq = _bounded_number(pair[0], "fft_freq")
         if freq is None:
             continue
+
+        # freq=0은 실제 FFT peak가 아니라 "FFT 없음" sentinel로 본다.
+        # 예: [[0.0, 55649.077]] 같은 잘못된 조합 방지.
+        if freq <= 0.0:
+            continue
+
         amp = None
         if len(pair) > 1:
             amp_raw = _finite_number(pair[1])
             if amp_raw is not None and abs(amp_raw) >= FFT_AMP_MISSING_EPS:
                 amp = _bounded_number(amp_raw, "fft_amp")
+
+        # freq는 있는데 amp가 None이면 불완전한 FFT로 남길 수 있음.
+        # fallback merge 로직이 필요한 경우를 위해 여기서는 append 유지.
         clean.append([freq, amp])
+
         if len(clean) >= SNAP_FFT_PAIRS:
             break
 
@@ -707,11 +1026,29 @@ def _merge_fft_missing_values(current_fft, fallback_fft):
     return _sanitize_fft(merged)
 
 
-def _sanitize_node_measurements(*, voltage=None, current=None, temperature=None, light_on=None, fft=None):
+def _sanitize_node_measurements(
+    *,
+    voltage=None,
+    current=None,
+    temperature=None,
+    light_on=None,
+    fft=None,
+):
+    temp_clean = _bounded_number(temperature, "temperature")
+
+    # 노드에서 온도센서 invalid로 올리는 sentinel 값은 그대로 전달
+    if temperature is not None:
+        try:
+            temp_raw = float(temperature)
+            if abs(temp_raw - (-999.0)) < 1e-6:
+                temp_clean = -999.0
+        except (TypeError, ValueError):
+            pass
+
     return {
         "voltage": _bounded_number(voltage, "voltage"),
         "current": _bounded_number(current, "current"),
-        "temperature": _bounded_number(temperature, "temperature"),
+        "temperature": temp_clean,
         "light_on": _sanitize_light_on(light_on),
         "fft": _sanitize_fft(fft),
     }
@@ -752,24 +1089,44 @@ def _sanitize_ai_result(*, ai_valid=None, ai_mse=None, ai_pred=None):
 
 
 def _fallback_snap_head_usable(snap: dict) -> bool:
-    if snap.get("tail_valid"):
-        return True
+    """
+    SNAP head에 들어있는 voltage/current/temperature/light_on 사용 가능 여부만 판단한다.
+
+    주의:
+    - ok=0이어도 head 값 자체는 정상일 수 있으므로 여기서 버리지 않는다.
+    - FFT 유효성은 여기서 판단하지 않는다.
+      FFT는 _sanitize_fft()와 SNAP 파싱부에서 freq > 0 기준으로 따로 drop한다.
+    """
     try:
         fft_count = int(snap.get("fft_count", 0) or 0)
     except (TypeError, ValueError):
         return False
+
+    temp = snap.get("temp")
+    temp_ok = _bounded_number(temp, "temperature") is not None
+
+    # 노드 온도센서 invalid sentinel -999는 그대로 허용
+    if not temp_ok and temp is not None:
+        try:
+            temp_ok = abs(float(temp) - (-999.0)) < 1e-6
+        except (TypeError, ValueError):
+            temp_ok = False
+
     return (
         _bounded_number(snap.get("volt"), "voltage") is not None
         and _bounded_number(snap.get("curr"), "current") is not None
-        and _bounded_number(snap.get("temp"), "temperature") is not None
+        and temp_ok
         and _sanitize_light_on(snap.get("light_on")) is not None
         and 0 <= fft_count <= SNAP_FFT_PAIRS
     )
 
-
 def build_rtc_kst_payload_from_dt(when: datetime.datetime) -> bytes:
     kst = datetime.timezone(datetime.timedelta(hours=9))
     now = when.astimezone(kst)
+    if build_rtc_kst_payload_with_sun_minutes is not None:
+        gps = _read_gateway_gps() if _read_gateway_gps is not None else None
+        return build_rtc_kst_payload_with_sun_minutes(now, 0, gps)
+
     year = int(now.year)
     return bytes([
         (year >> 8) & 0xFF,
@@ -792,6 +1149,8 @@ class CmdRouter:
         self.scheduler = scheduler
         self.runtime_config_path = "config/gw_runtime_config.json"
 
+        self.direct_uplink_publish = str(os.getenv("DIRECT_UPLINK_PUBLISH", "1")).lower() not in ("0", "false", "no", "off")
+        self.store_snap_batch_enabled = str(os.getenv("STORE_SNAP_BATCH_ENABLED", "0")).lower() in ("1", "true", "yes", "on")
         self.snap_batch_period_sec = 60  # gateway snap batch publish period (seconds)
         self.gw_env_period_sec = 60.0
         self._load_runtime_config()
@@ -818,6 +1177,8 @@ class CmdRouter:
             "uid": {},   
         }
         self.pending = defaultdict(deque)
+        self.pending_batches = {}
+        self._batch_lock = threading.Lock()
         self.log = logging.getLogger("gw")
 
         self._stop_event = threading.Event()
@@ -910,6 +1271,95 @@ class CmdRouter:
             "snap_batch_period_sec": float(self.snap_batch_period_sec),
             "gw_env_period_sec": float(self.gw_env_period_sec),
         }, self.runtime_config_path)
+
+    def _current_kst_datetime(self) -> datetime.datetime:
+        kst = datetime.timezone(datetime.timedelta(hours=9))
+        if self._server_time_base is not None and self._server_time_monotonic is not None:
+            try:
+                elapsed = time.monotonic() - float(self._server_time_monotonic)
+                return (self._server_time_base + datetime.timedelta(seconds=elapsed)).astimezone(kst)
+            except Exception:
+                pass
+        return datetime.datetime.now(kst)
+
+    def _send_rtc_kst_sync(self, *, target_mid: int = 0, when: datetime.datetime | None = None,
+                           request_msg_id: int | None = None, reason: str = "manual") -> dict:
+        sync_time = when or self._current_kst_datetime()
+        target_mid_int = int(target_mid or 0)
+        if self.scheduler is not None and hasattr(self.scheduler, "build_rtc_sync_payload"):
+            rtc_extra = self.scheduler.build_rtc_sync_payload(sync_time, target_mid=target_mid_int)
+        else:
+            rtc_extra = build_rtc_kst_payload_from_dt(sync_time)
+        rtc_msg_id16 = (
+            int(request_msg_id) & 0xFFFF
+            if request_msg_id is not None
+            else int(sync_time.timestamp()) & 0xFFFF
+        )
+
+        if (
+            target_mid_int == 0
+            and self.scheduler is not None
+            and hasattr(self.scheduler, "sync_rtc_kst_broadcast")
+        ):
+            self.scheduler.sync_rtc_kst_broadcast(sync_time)
+        else:
+            self.wisun.send_cmd_bytes(
+                target_mid_int,
+                CMD_SET_RTC_KST,
+                msg_id=rtc_msg_id16,
+                flags=0x00,
+                extra=rtc_extra,
+            )
+
+        info = {
+            "queued": True,
+            "target_mid": target_mid_int,
+            "msg_id": rtc_msg_id16,
+            "time": sync_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "extra_hex": rtc_extra.hex(),
+            "reason": reason,
+        }
+        print(
+            f"[CMD] rtc_sync_kst reason={reason} target_mid={target_mid_int} "
+            f"msg_id={rtc_msg_id16} time={info['time']} extra={rtc_extra.hex()}",
+            flush=True,
+        )
+        return info
+
+    def _handle_rtc_kst_request(self, *, mid: int, ts: int, node_msg_id: int | None = None,
+                                target_mid: int | None = None, flags: int | None = None,
+                                ttl: int | None = None, raw_hex: str = "") -> None:
+        try:
+            sync_info = self._send_rtc_kst_sync(
+                target_mid=mid,
+                request_msg_id=node_msg_id,
+                reason="node_boot_request",
+            )
+            if self.mqtt is not None:
+                self.mqtt.publish_json(f"gw/{self.gwid}/raw", {
+                    "cmd": "rtc_kst_request",
+                    "gid": self.gwid,
+                    "mid": mid,
+                    "ts": ts,
+                    "node_msg_id": node_msg_id,
+                    "sync": sync_info,
+                    "rx_target_mid": target_mid,
+                    "rx_cmd": CMD_SET_RTC_KST,
+                    "rx_flags": flags,
+                    "rx_ttl": ttl,
+                    "payload_hex": raw_hex,
+                })
+        except Exception as e:
+            print(f"[GW] RTC_KST request sync failed mid={mid} err={e}", flush=True)
+            if self.mqtt is not None:
+                self.mqtt.publish_json(f"gw/{self.gwid}/raw", {
+                    "cmd": "rtc_kst_request_error",
+                    "gid": self.gwid,
+                    "mid": mid,
+                    "ts": ts,
+                    "error": str(e),
+                    "payload_hex": raw_hex,
+                })
         
     
     def _publish_gw_periodic_env(self):
@@ -925,15 +1375,47 @@ class CmdRouter:
             env_values = _extract_env_values(latest)
             gps_latest = read_gw_info_latest()
             gps_values = _extract_gps_values(gps_latest)
+            now_ts = int(time.time())
+            tx_ts = (
+                env_values.get("ts")
+                if isinstance(env_values, dict) and env_values.get("ts") is not None
+                else gps_values.get("ts")
+                if isinstance(gps_values, dict) and gps_values.get("ts") is not None
+                else now_ts
+            )
+            mqtt_status = _gateway_mqtt_status(self.mqtt)
+            gnss_status = _gateway_gnss_status(gps_values, now_ts)
+            comm_online = bool(mqtt_status.get("online"))
+            comm_status = "normal" if comm_online else "offline"
 
-            if env_values or gps_values:
+            if self.mqtt is not None and (env_values or gps_values or mqtt_status):
                 msg = {
                     "cmd": "gw_env",          # ← 이벤트/스냅샷용 cmd
                     "gid": self.gwid,
                     "reason": "periodic",
-                    "ts": int(time.time()),
+                    "ts": now_ts,
+                    "tx_ts": tx_ts,
                     "interval": float(getattr(self, "snap_batch_period_sec", 60.0) or 60.0),
                     "sensor_interval": float(getattr(self, "gw_env_period_sec", 60.0) or 60.0),
+                    "gnss_lock": bool(gnss_status.get("lock")),
+                    "gnss_lock_status": gnss_status.get("status"),
+                    "gnss_lock_text": gnss_status.get("status_text"),
+                    "comm_status": comm_status,
+                    "comm_status_text": "정상" if comm_online else "-",
+                    "gateway_status": {
+                        **mqtt_status,
+                        "ts": now_ts,
+                    },
+                    "comm": {
+                        **mqtt_status,
+                        "status": comm_status,
+                        "status_text": "정상" if comm_online else "-",
+                    },
+                    "gnss": {
+                        **gnss_status,
+                        "lat": gps_values.get("lat") if isinstance(gps_values, dict) else None,
+                        "lon": gps_values.get("lon") if isinstance(gps_values, dict) else None,
+                    },
                 }
                 if env_values:
                     msg["values"] = env_values
@@ -986,12 +1468,17 @@ class CmdRouter:
                 if not cmd:
                     cmd = parts[3]
 
+            if root == "gw" and gw_id == self.gwid and topic_cmd == "node" and len(parts) > 3:
+                target = "node"
+                if not cmd:
+                    cmd = parts[3]
+
             if root == "gw" and gw_id == self.gwid and topic_cmd in ("gw_env", "mid_lists", "boot_success"):
                 return
 
             # topic이 gw/{gwid}/{cmd} 형태면 target을 gw로 보정
             if root == "gw" and gw_id == self.gwid and topic_cmd:
-                if topic_cmd not in ("cmd_result", "response", "raw", "gw_env", "mid_lists", "boot_success"):
+                if topic_cmd not in ("cmd_result", "response", "raw", "gw_env", "mid_lists", "boot_success", "node"):
                     if not target or target == "node":
                         target = "gw"
                     if not cmd:
@@ -1220,23 +1707,11 @@ class CmdRouter:
                         "target_mid": 0,
                     }
                     try:
-                        if self.scheduler is not None and hasattr(self.scheduler, "sync_rtc_kst_broadcast"):
-                            self.scheduler.sync_rtc_kst_broadcast(server_time_kst)
-                        else:
-                            rtc_extra = build_rtc_kst_payload_from_dt(server_time_kst)
-                            rtc_msg_id16 = int(server_time_kst.timestamp()) & 0xFFFF
-                            self.wisun.send_cmd_bytes(
-                                0,
-                                CMD_SET_RTC_KST,
-                                msg_id=rtc_msg_id16,
-                                flags=0x00,
-                                extra=rtc_extra,
-                            )
-                        node_rtc_sync = {
-                            "queued": True,
-                            "target_mid": 0,
-                            "time": server_time_kst.strftime("%Y-%m-%d %H:%M:%S"),
-                        }
+                        node_rtc_sync = self._send_rtc_kst_sync(
+                            target_mid=0,
+                            when=server_time_kst,
+                            reason="set_gw_time",
+                        )
                         print(f"[CMD] set_gw_time -> rtc_sync_broadcast time={node_rtc_sync['time']}")
                     except Exception as e:
                         node_rtc_sync = {
@@ -1276,6 +1751,99 @@ class CmdRouter:
                 }
                 _publish_gw(resp)
                 _verbose_print("[CMD] send_ping_ack:", resp)
+
+            def _gw_lte_on():
+                connect_service = str(
+                    data.get("connect_service")
+                    or payload.get("connect_service")
+                    or os.getenv("LTE_CONNECT_SERVICE", "lte_connect.service")
+                )
+                up_service = str(
+                    data.get("up_service")
+                    or payload.get("up_service")
+                    or os.getenv("LTE_UP_SERVICE", "lte.service")
+                )
+                timeout_sec = float(
+                    data.get("timeout_sec")
+                    or payload.get("timeout_sec")
+                    or os.getenv("LTE_ON_TIMEOUT_SEC", "180")
+                    or 180
+                )
+
+                start_resp = {
+                    "cmd": "lte_on_ack",
+                    "gid": self.gwid,
+                    "result": "accepted",
+                    "msg_id": raw_msg_id,
+                    "ts": int(time.time()),
+                    "services": {
+                        "connect": connect_service,
+                        "up": up_service,
+                    },
+                }
+                _publish_gw(start_resp)
+                _verbose_print("[CMD] lte_on_ack accepted:", start_resp)
+
+                def _lte_on_worker():
+                    steps = []
+                    ok = True
+                    reason = None
+                    for name, service in (("connect", connect_service), ("up", up_service)):
+                        try:
+                            proc = subprocess.run(
+                                ["sudo", "systemctl", "start", service],
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                                timeout=timeout_sec,
+                            )
+                            step = {
+                                "step": name,
+                                "service": service,
+                                "rc": proc.returncode,
+                                "stdout": (proc.stdout or "")[-4000:],
+                                "stderr": (proc.stderr or "")[-4000:],
+                            }
+                            steps.append(step)
+                            if proc.returncode != 0:
+                                ok = False
+                                reason = f"{name}_failed:{proc.returncode}"
+                                break
+                        except subprocess.TimeoutExpired as e:
+                            ok = False
+                            reason = f"{name}_timeout"
+                            steps.append({
+                                "step": name,
+                                "service": service,
+                                "timeout_sec": timeout_sec,
+                                "stdout": (e.stdout or "")[-4000:] if isinstance(e.stdout, str) else "",
+                                "stderr": (e.stderr or "")[-4000:] if isinstance(e.stderr, str) else "",
+                            })
+                            break
+                        except Exception as e:
+                            ok = False
+                            reason = f"{name}_error:{e}"
+                            steps.append({
+                                "step": name,
+                                "service": service,
+                                "error": str(e),
+                            })
+                            break
+
+                    resp = {
+                        "cmd": "lte_on_result",
+                        "gid": self.gwid,
+                        "result": "success" if ok else "fail",
+                        "msg_id": raw_msg_id,
+                        "ts": int(time.time()),
+                        "steps": steps,
+                    }
+                    if reason:
+                        resp["reason"] = reason
+                    _publish_gw(resp)
+                    print("[CMD] lte_on_result:", resp, flush=True)
+
+                threading.Thread(target=_lte_on_worker, daemon=True).start()
 
             def _gw_set_env_interval():
                 interval_raw = (
@@ -1445,6 +2013,7 @@ class CmdRouter:
                 "set_gw_env_interval": _gw_set_gw_env_interval,
                 "set_gw_time": _gw_set_gw_time,
                 "send_ping": _gw_send_ping,
+                "lte_on": _gw_lte_on,
             }
 
             h = gw_handlers.get(gw_cmd)
@@ -1465,7 +2034,13 @@ class CmdRouter:
         # =========================================================================
         # Node commands (node/* 또는 기본 target=node)
         # =========================================================================
-        NODE_ALIAS = {"get_status": "get_node_status"}
+        NODE_ALIAS = {
+            "get_status": "get_node_status",
+            69: "set_setting",
+            "69": "set_setting",
+            "0x45": "set_setting",
+            "SET_ASTRO_SETTING": "set_setting",
+        }
         node_cmd = NODE_ALIAS.get(cmd, cmd)
 
         """ NODE_FORWARD_TABLE: dict[str, dict] = {
@@ -1502,7 +2077,7 @@ class CmdRouter:
             cmd_code = int(spec["code"])
 
             extra = b""
-            # extra 패킹(필요한 것만 최소로)
+            # extra 패킹
             if cmd_key == "set_channel":
                 ch = int(data.get("ch", payload.get("ch", 0)) or 0) & 0xFF
                 extra = bytes([ch])
@@ -1707,7 +2282,6 @@ class CmdRouter:
                     light_on=r.get("light_on"),
                     fft=r.get("fft"),
                 )
-                # 흔히 있는 것들(있으면 넣고, 없으면 스킵)
                 for k in (
                     "uid", "mac", "ch", "channel",
                     "online", "last_ts", "ts",
@@ -1837,6 +2411,66 @@ class CmdRouter:
                     parsed = default
                 return max(0, min(255, parsed))
 
+            astro_keys = (
+                "standard_lat",
+                "standard_lon",
+                "install_lat",
+                "install_lon",
+            )
+            coord_update = self._coord_update_enabled(d)
+            cmd_is_astro_setting = cmd in (
+                CMD_SET_ASTRO_SETTING,
+                str(CMD_SET_ASTRO_SETTING),
+                "0x45",
+                "SET_ASTRO_SETTING",
+            )
+            is_astro_setting = (
+                coord_update is not False
+                and (
+                    cmd_is_astro_setting
+                    or coord_update is True
+                    or any(k in d for k in astro_keys)
+                )
+            )
+
+            if is_astro_setting:
+                try:
+                    extra, tx_meta, _public_data = self._build_astro_setting_payload(d)
+                except Exception as e:
+                    _node_fail(api_cmd, f"invalid_astro_setting:{e}", mid=mid)
+                    return
+
+                # Coordinate-bearing individual settings use the same unified
+                # SET_SETTING(0x31) payload as batch settings.
+                tx_msg_id16 = int(msg_id_int) & 0xFFFF
+                try:
+                    self._pending_push(
+                        mid=mid,
+                        api_cmd=api_cmd,
+                        srv_msg_id=raw_msg_id,
+                        want="ack",
+                        tx_msg_id=tx_msg_id16,
+                        ttl_sec=3.0,
+                        meta=tx_meta,
+                    )
+
+                    self.wisun.send_cmd_bytes(mid, CMD_SET_SETTING, msg_id=tx_msg_id16, flags=0x00, extra=extra)
+                    print(f"[CMD TX SET_SETTING] mid={mid} msg_id={tx_msg_id16} meta={tx_meta}", flush=True)
+
+                    _publish_node(api_cmd, {
+                        "cmd": f"{api_cmd}_ack",
+                        "gid": self.gwid,
+                        "mid": mid,
+                        "msg_id": tx_msg_id16,
+                        "result": "success",
+                        "queued": True,
+                        **tx_meta,
+                    })
+                    return
+                except Exception as e:
+                    _node_fail(api_cmd, f"send_error:{e}", mid=mid)
+                    return
+
             def parse_time(s: str | None):
                 if not s:
                     return 0, 0
@@ -1866,7 +2500,11 @@ class CmdRouter:
             if on_off_mode_raw is None:
                 on_off_mode_raw = d.get("mode")
 
-            on_off_mode     = parse_u8(on_off_mode_raw, 0)
+            try:
+                on_off_mode = self._normalize_firmware_light_mode(on_off_mode_raw, 0)
+            except Exception as e:
+                _node_fail(api_cmd, f"invalid_setting:{e}", mid=mid)
+                return
             on_corr_mode    = parse_u8(d.get("on_correction_mode"), 0)
             on_corr_time    = parse_u8(d.get("on_correction_time"), 0)
             off_corr_mode   = parse_u8(d.get("off_correction_mode"), 0)
@@ -1874,9 +2512,6 @@ class CmdRouter:
             forced_time     = int(d.get("forced_time", 0) or 0)
             saving_mode     = parse_u8(d.get("saving_mode"), 0)
             snap_enable     = 1 if int(d.get("snap_enable", 1) or 1) else 0
-
-            # 노드 프로토콜상 snap_period_min 바이트는 유지해야 하지만,
-            # 서버 payload에서는 interval만 신뢰해서 채운다.
 
             # 서버 payload 호환:
             # 1) interval
@@ -1921,6 +2556,8 @@ class CmdRouter:
                 "tx_on_off_mode": on_off_mode,
                 "tx_on_time": f"{on_h:02d}:{on_m:02d}",
                 "tx_off_time": f"{off_h:02d}:{off_m:02d}",
+                "on_time": f"{on_h:02d}:{on_m:02d}",
+                "off_time": f"{off_h:02d}:{off_m:02d}",
                 "tx_on_correction_mode": on_corr_mode,
                 "tx_on_correction_time": on_corr_time,
                 "tx_off_correction_mode": off_corr_mode,
@@ -1976,6 +2613,81 @@ class CmdRouter:
         def _node_set_setting():
             _verbose_print(f"[HANDLER] set_setting → mid={payload.get('mid')} msg_id={payload.get('msg_id')} topic={topic}")
             _node_apply_setting("set_setting")
+
+        def _node_update_gw_node_setting():
+            d = payload.get("payload") or payload.get("data") or data or payload or {}
+            try:
+                extra, tx_meta, public_data = self._build_astro_setting_payload(d)
+            except Exception as e:
+                _node_fail("update_gw_node_setting", f"invalid_astro_setting:{e}")
+                return
+
+            mids = self._resolve_batch_target_mids(payload, d)
+            if not mids:
+                _node_fail("update_gw_node_setting", "no_target_nodes")
+                return
+
+            batch_id = str(payload.get("batch_id") or raw_msg_id or msg_id_int)
+            now_ts = int(time.time())
+            expected_mids = [int(mid) for mid in mids]
+            with self._batch_lock:
+                self.pending_batches[batch_id] = {
+                    "api": "update_gw_node_setting",
+                    "srv_msg_id": raw_msg_id,
+                    "started_at": now_ts,
+                    "expected_mids": expected_mids,
+                    "results": {},
+                    "data": public_data,
+                    "tx_extra_hex": extra.hex(),
+                }
+
+            send_failures = []
+            base_msg_id = int(msg_id_int) & 0xFFFF
+            for idx, mid in enumerate(expected_mids):
+                tx_msg_id16 = (base_msg_id + idx) & 0xFFFF
+                per_node_meta = dict(tx_meta)
+                per_node_meta.update({
+                    "batch_id": batch_id,
+                    "aggregate_api": "update_gw_node_setting",
+                })
+                try:
+                    self._pending_push(
+                        mid=mid,
+                        api_cmd="update_gw_node_setting",
+                        srv_msg_id=raw_msg_id,
+                        want="ack",
+                        tx_msg_id=tx_msg_id16,
+                        ttl_sec=5.0,
+                        meta=per_node_meta,
+                    )
+                    self.wisun.send_cmd_bytes(mid, CMD_SET_SETTING, msg_id=tx_msg_id16, flags=0x00, extra=extra)
+                    print(
+                        f"[CMD TX BATCH SET_SETTING] batch_id={batch_id} "
+                        f"mid={mid} msg_id={tx_msg_id16} extra={extra.hex()}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    send_failures.append((mid, tx_msg_id16, str(e)))
+                    self._batch_record_node_result(
+                        batch_id,
+                        mid,
+                        result="fail",
+                        node_msg_id=tx_msg_id16,
+                        ts=now_ts,
+                        reason=f"send_error:{e}",
+                    )
+
+            if send_failures and len(send_failures) == len(expected_mids):
+                with self._batch_lock:
+                    finalize_payload = self._batch_finalize_locked(batch_id)
+                if finalize_payload:
+                    self.mqtt.publish_json(finalize_payload["topic"], finalize_payload["payload"])
+                return
+
+            _verbose_print(
+                f"[BATCH QUEUED] batch_id={batch_id} targets={expected_mids} "
+                f"send_failures={send_failures} tx_meta={tx_meta}"
+            )
 
         def _node_set_node_info():
             _verbose_print(f"[HANDLER] set_node_info → mid={payload.get('mid')} msg_id={payload.get('msg_id')} topic={topic}")
@@ -2077,6 +2789,7 @@ class CmdRouter:
         node_handlers = {
             "get_node_status": _node_get_status,
             "set_setting": _node_set_setting,
+            "update_gw_node_setting": _node_update_gw_node_setting,
             "set_node_info": _node_set_node_info, 
             "set_mid_chan": _node_set_mid_chan,
             "setid_key": _node_setid_key,
@@ -2103,6 +2816,320 @@ class CmdRouter:
 
     def _now(self) -> float:
         return time.time()
+
+    def _parse_minute_of_day(self, value):
+        if value is None:
+            raise ValueError("missing_time")
+        if isinstance(value, str):
+            text = value.strip()
+            if "T" in text:
+                text = text.split("T", 1)[1]
+            if text.endswith("Z"):
+                text = text[:-1]
+            if "." in text:
+                text = text.split(".", 1)[0]
+            if ":" in text:
+                parts = text.split(":")
+                h = int(parts[0])
+                m = int(parts[1]) if len(parts) > 1 else 0
+                minute = h * 60 + m
+            else:
+                minute = int(text)
+        else:
+            minute = int(value)
+        if not 0 <= minute <= 1439:
+            raise ValueError("time_out_of_range")
+        return minute
+
+    def _coord_to_i32(self, value, *, name: str, low: float, high: float) -> int:
+        if value is None:
+            raise ValueError(f"missing_{name}")
+        coord = float(value)
+        if not math.isfinite(coord) or not low <= coord <= high:
+            raise ValueError(f"{name}_out_of_range")
+        return int(round(coord * 10_000_000))
+
+    def _coord_to_i32_optional(self, d: dict, name: str, *, low: float, high: float, required: bool) -> int:
+        value = (d or {}).get(name)
+        if value is None:
+            if required:
+                raise ValueError(f"missing_{name}")
+            return 0
+        return self._coord_to_i32(value, name=name, low=low, high=high)
+
+    def _parse_apply_coord_type(self, value) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("standard", "std", "base", "0"):
+                return 0
+            if text in ("install", "installed", "site", "1"):
+                return 1
+        parsed = int(value)
+        if parsed not in (0, 1):
+            raise ValueError("apply_coord_type_out_of_range")
+        return parsed
+
+    def _is_falseish(self, value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return value.strip().lower() in ("0", "false", "no", "n", "off")
+        return not bool(value)
+
+    def _coord_update_enabled(self, d: dict) -> bool | None:
+        if not isinstance(d, dict) or "coord_update" not in d:
+            return None
+        return not self._is_falseish(d.get("coord_update"))
+
+    def _normalize_firmware_light_mode(self, value, default: int = 0) -> int:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            text = value.strip().lower()
+            mode_map = {
+                "sunrise": 0,
+                "sunset": 0,
+                "sunrise_sunset": 0,
+                "sun": 0,
+                "civil": 1,
+                "civil_twilight": 1,
+                "twilight": 1,
+                "fixed": 2,
+                "fixed_time": 2,
+                "manual": 3,
+                "force": 3,
+                "forced": 3,
+                "\uc77c\ucd9c": 0,
+                "\uc77c\ubab0": 0,
+                "\uc77c\ucd9c\uc77c\ubab0": 0,
+                "\uc2dc\ubbfc\ubc15\uba85": 1,
+                "\ubc15\uba85": 1,
+                "\uace0\uc815\uc2dc\uac04": 2,
+                "\uace0\uc815": 2,
+                "\uc218\ub3d9": 3,
+                "\uac15\uc81c": 3,
+            }
+            if text in mode_map:
+                return mode_map[text]
+        parsed = int(value)
+        # Server/API mode is 1-based, firmware mode is 0-based:
+        # 0=sunrise/sunset, 1=civil twilight, 2=fixed time, 3=manual/forced.
+        if 1 <= parsed <= 4:
+            return parsed - 1
+        if parsed == 0:
+            return 0
+        raise ValueError("mode_out_of_range")
+
+    def _build_astro_setting_payload(self, d: dict):
+        d = d or {}
+        apply_coord_type = self._parse_apply_coord_type(d.get("apply_coord_type"))
+
+        on_min = self._parse_minute_of_day(d.get("on_time"))
+        off_min = self._parse_minute_of_day(d.get("off_time"))
+        uses_standard_coord = apply_coord_type == 0
+        uses_install_coord = apply_coord_type == 1
+        standard_lat_i32 = self._coord_to_i32_optional(
+            d, "standard_lat", low=-90.0, high=90.0, required=uses_standard_coord
+        )
+        standard_lon_i32 = self._coord_to_i32_optional(
+            d, "standard_lon", low=-180.0, high=180.0, required=uses_standard_coord
+        )
+        install_lat_i32 = self._coord_to_i32_optional(
+            d, "install_lat", low=-90.0, high=90.0, required=uses_install_coord
+        )
+        install_lon_i32 = self._coord_to_i32_optional(
+            d, "install_lon", low=-180.0, high=180.0, required=uses_install_coord
+        )
+
+        selected_lat_i32 = install_lat_i32 if apply_coord_type else standard_lat_i32
+        selected_lon_i32 = install_lon_i32 if apply_coord_type else standard_lon_i32
+
+        mode = self._normalize_firmware_light_mode(d.get("on_off_mode", d.get("mode")), 0)
+        on_corr_mode = int(d.get("on_correction_mode", 0) or 0) & 0xFF
+        on_corr_time = int(d.get("on_correction_time", 0) or 0) & 0xFF
+        off_corr_mode = int(d.get("off_correction_mode", 0) or 0) & 0xFF
+        off_corr_time = int(d.get("off_correction_time", 0) or 0) & 0xFF
+        forced_time = max(0, min(0xFFFF, int(d.get("forced_time", 0) or 0)))
+        saving_mode = int(d.get("saving_mode", 0) or 0) & 0xFF
+
+        def _hm(value, default="00:00"):
+            text = str(value if value is not None else default).strip()
+            if "T" in text:
+                text = text.split("T", 1)[1]
+            if text.endswith("Z"):
+                text = text[:-1]
+            parts = text.split(":")
+            return max(0, min(23, int(parts[0]))), max(0, min(59, int(parts[1]) if len(parts) > 1 else 0))
+
+        saving_start_h, saving_start_m = _hm(d.get("saving_start_time"))
+        saving_end_h, saving_end_m = _hm(d.get("saving_end_time"))
+        on_h, on_m = divmod(on_min, 60)
+        off_h, off_m = divmod(off_min, 60)
+        snap_enable = 1 if int(d.get("snap_enable", 1) or 1) else 0
+        interval_min = max(1, min(120, int(d.get("interval", d.get("snap_period_min", 60)) or 60)))
+
+        # Unified SET_SETTING(0x31), 30-byte payload.
+        # Bytes 20..29 enable and carry the selected coordinate.
+        extra = bytes([
+            mode, on_corr_mode, on_corr_time, off_corr_mode, off_corr_time,
+            forced_time & 0xFF, (forced_time >> 8) & 0xFF,
+            saving_mode, saving_start_h, saving_start_m,
+            saving_end_h, saving_end_m, snap_enable, interval_min,
+            on_h, on_m, off_h, off_m,
+            interval_min & 0xFF, (interval_min >> 8) & 0xFF,
+            1, apply_coord_type,
+        ]) + struct.pack(">ii", selected_lat_i32, selected_lon_i32)
+        meta = {
+            "tx_cmd_code": CMD_SET_SETTING,
+            "tx_on_off_mode": mode,
+            "tx_apply_coord_type": apply_coord_type,
+            "tx_on_time": on_min,
+            "tx_off_time": off_min,
+            "on_time": f"{on_min // 60:02d}:{on_min % 60:02d}",
+            "off_time": f"{off_min // 60:02d}:{off_min % 60:02d}",
+            "on_time_min": on_min,
+            "off_time_min": off_min,
+            "tx_standard_lat": standard_lat_i32,
+            "tx_standard_lon": standard_lon_i32,
+            "tx_install_lat": install_lat_i32,
+            "tx_install_lon": install_lon_i32,
+            "tx_extra_hex": extra.hex(),
+        }
+        public_data = {
+            "mode": mode,
+            "apply_coord_type": apply_coord_type,
+            "on_time": on_min,
+            "off_time": off_min,
+            "standard_lat": float(d["standard_lat"]) if d.get("standard_lat") is not None else None,
+            "standard_lon": float(d["standard_lon"]) if d.get("standard_lon") is not None else None,
+            "install_lat": float(d["install_lat"]) if d.get("install_lat") is not None else None,
+            "install_lon": float(d["install_lon"]) if d.get("install_lon") is not None else None,
+            "on_correction_mode": on_corr_mode,
+            "on_correction_time": on_corr_time,
+            "off_correction_mode": off_corr_mode,
+            "off_correction_time": off_corr_time,
+        }
+        return extra, meta, public_data
+
+    def _resolve_batch_target_mids(self, payload: dict, d: dict):
+        candidates = (
+            payload.get("mids")
+            or payload.get("mid_list")
+            or payload.get("target_mids")
+            or d.get("mids")
+            or d.get("mid_list")
+            or d.get("target_mids")
+            or d.get("nodes")
+            or payload.get("nodes")
+        )
+        mids = []
+        if candidates is not None:
+            if isinstance(candidates, (int, str)):
+                candidates = [candidates]
+            for item in candidates:
+                if isinstance(item, dict):
+                    item = item.get("mid")
+                try:
+                    mid = int(item or 0)
+                except Exception:
+                    continue
+                if mid > 0 and mid not in mids:
+                    mids.append(mid)
+            return mids
+
+        if self.store is None or not hasattr(self.store, "all_nodes"):
+            return []
+        try:
+            for rec in self.store.all_nodes():
+                if not isinstance(rec, dict):
+                    continue
+                mid = int(rec.get("mid") or 0)
+                if mid > 0 and mid not in mids:
+                    mids.append(mid)
+        except Exception as e:
+            print(f"[BATCH] resolve target mids failed: {e}", flush=True)
+            return []
+        return mids
+
+    def _batch_record_node_result(self, batch_id, mid: int, *, result: str,
+                                  node_msg_id=None, err_code=None, uid=None,
+                                  ts=None, reason=None, ack_data=None):
+        finalize_payload = None
+        with self._batch_lock:
+            ctx = self.pending_batches.get(batch_id)
+            if not ctx:
+                return False
+            item = {
+                "mid": int(mid),
+                "result": result,
+            }
+            if uid is not None:
+                item["uid"] = uid
+            if node_msg_id is not None:
+                item["node_msg_id"] = int(node_msg_id)
+            if err_code is not None:
+                item["err_code"] = int(err_code)
+            if reason:
+                item["reason"] = reason
+            if ts is not None:
+                item["ts"] = ts
+            if ack_data:
+                item.update(dict(ack_data))
+            ctx["results"][int(mid)] = item
+
+            expected = set(ctx.get("expected_mids") or [])
+            if expected and expected.issubset(set(ctx["results"].keys())):
+                finalize_payload = self._batch_finalize_locked(batch_id)
+
+        if finalize_payload:
+            self.mqtt.publish_json(finalize_payload["topic"], finalize_payload["payload"])
+        return True
+
+    def _batch_finalize_locked(self, batch_id):
+        ctx = self.pending_batches.pop(batch_id, None)
+        if not ctx:
+            return None
+
+        expected = list(ctx.get("expected_mids") or [])
+        results_by_mid = ctx.get("results") or {}
+        nodes = []
+        for mid in expected:
+            if mid in results_by_mid:
+                nodes.append(results_by_mid[mid])
+            else:
+                nodes.append({"mid": int(mid), "result": "timeout", "reason": "timeout"})
+
+        success_count = sum(1 for item in nodes if item.get("result") == "success")
+        timeout_count = sum(1 for item in nodes if item.get("result") == "timeout")
+        fail_count = len(nodes) - success_count - timeout_count
+        result = "success" if success_count == len(nodes) and len(nodes) > 0 else "fail"
+        reason = None if result == "success" else "partial_ack"
+
+        payload = {
+            "cmd": f"{ctx.get('api', 'update_gw_node_setting')}_ack",
+            "gid": self.gwid,
+            "msg_id": ctx.get("srv_msg_id"),
+            "batch_id": batch_id,
+            "result": result,
+            "total": len(nodes),
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "timeout_count": timeout_count,
+            "ts": int(time.time()),
+            "data": ctx.get("data") or {},
+            "nodes": nodes,
+        }
+        if reason:
+            payload["reason"] = reason
+        if ctx.get("tx_extra_hex"):
+            payload["tx_extra_hex"] = ctx["tx_extra_hex"]
+
+        return {
+            "topic": f"node/{self.gwid}/response/{ctx.get('api', 'update_gw_node_setting')}",
+            "payload": payload,
+        }
 
     def _ensure_comm_health(self, mid: int) -> dict | None:
         try:
@@ -2291,6 +3318,35 @@ class CmdRouter:
                 ]
                 for stale_key in stale_keys:
                     self._recent_uplink.pop(stale_key, None)
+        return False
+    
+    def _should_drop_duplicate_global_uplink(self, kind: str, fingerprint) -> bool:
+        if fingerprint is None:
+            return False
+
+        now = time.monotonic()
+        window = float(getattr(self, "uplink_dedupe_window_sec", 2.0) or 2.0)
+        if window <= 0:
+            return False
+
+        key = (str(kind), fingerprint)
+
+        with self._recent_uplink_lock:
+            prev = self._recent_uplink.get(key)
+            if prev is not None and (now - prev) <= window:
+                return True
+
+            self._recent_uplink[key] = now
+
+            expire_before = now - max(window * 4.0, 10.0)
+            if len(self._recent_uplink) > 512:
+                stale_keys = [
+                    k for k, seen_ts in self._recent_uplink.items()
+                    if seen_ts < expire_before
+                ]
+                for stale_key in stale_keys:
+                    self._recent_uplink.pop(stale_key, None)
+
         return False
     
     def _store_latest_by_mid(self, mid: int):
@@ -2484,11 +3540,26 @@ class CmdRouter:
             light_on=light_on,
             fft=fft,
         )
+
         clean_ai = _sanitize_ai_result(
             ai_valid=ai_valid,
             ai_mse=ai_mse,
             ai_pred=ai_pred,
         )
+
+        # raw temperature가 들어왔는데 sanitize 후 None이면,
+        # 예: 노드가 -999.0을 보낸 상황.
+        # 이때 NodeStore의 기존 temperature 값을 지워야 함.
+        """ temperature_raw_present = temperature is not None
+        temperature_invalid = temperature_raw_present and clean.get("temperature") is None """
+
+        """ if temperature_invalid:
+            _verbose_print(
+                f"[TEMP INVALID CLEAR] mid={mid_int} raw_temperature={temperature} "
+                f"clean_temperature={clean.get('temperature')}",
+                flush=True,
+            ) """
+
         if any(v is not None for v in (voltage, current, temperature, light_on, fft)):
             dropped = [
                 name for name, raw in (
@@ -2507,6 +3578,7 @@ class CmdRouter:
                     f"'temperature': {temperature}, 'light_on': {light_on}, 'fft': {fft}}}",
                     flush=True,
                 )
+
         if any(v is not None for v in (ai_valid, ai_mse, ai_pred)):
             dropped_ai = [
                 name for name, raw in (
@@ -2531,6 +3603,7 @@ class CmdRouter:
         )
 
         update_source = source or ("snap" if any(v is not None for v in clean.values()) else "identity")
+
         uid_to_store = uid
         if prev is not None and uid is not None and update_source not in ("snap", "event"):
             prev_uid = prev.get("uid")
@@ -2542,17 +3615,26 @@ class CmdRouter:
                 )
                 uid_to_store = prev_uid
 
-        has_measure = any(v is not None for v in clean.values())
-        if has_measure and update_last_snap_ts:
+        # clean 값 중 하나라도 유효하면 측정값 있음.
+        # 단, temperature=-999만 들어오면 clean temperature는 None이라
+        # has_measure가 False가 될 수 있음.
+        # 하지만 invalid temperature도 SNAP 수신은 맞으므로 last_snap_ts 갱신은 해주는 게 좋음.
+        has_clean_measure = any(v is not None for v in clean.values())
+        has_raw_measure = any(v is not None for v in (voltage, current, temperature, light_on, fft))
+        has_measure = has_clean_measure or has_raw_measure
+
+        if has_clean_measure and update_last_snap_ts:
             self._remember_good_measurements(mid_int, ts, clean)
+
         try:
-            good_temperature = clean["temperature"] if has_measure and update_last_snap_ts else None
+            good_temperature = clean["temperature"] if has_clean_measure and update_last_snap_ts else None
             good_fft = (
                 _complete_fft_or_none(clean["fft"])
-                if has_measure and update_last_snap_ts
+                if has_clean_measure and update_last_snap_ts
                 else None
             )
             good_measurement_ts = ts if (good_temperature is not None or good_fft is not None) else None
+
             rec = self.store.upsert(
                 uid=uid_to_store,
                 mid=mid_int,
@@ -2572,7 +3654,12 @@ class CmdRouter:
                 last_good_temperature=good_temperature,
                 last_good_fft=good_fft,
                 last_good_measurement_ts=good_measurement_ts,
+
+                # 추가: invalid temperature가 들어오면 기존 저장 온도 삭제                
             )
+        except TypeError as e:
+            print("[NodeStore] update error(remember_node_seen): upsert signature may need clear_temperature:", e)
+            return prev
         except Exception as e:
             print("[NodeStore] update error(remember_node_seen):", e)
             return prev
@@ -2581,9 +3668,12 @@ class CmdRouter:
             return prev
 
         self._comm_mark_success(mid_int, ts)
+
         _verbose_print(
             f"[NODE_SEEN] mid={mid_int} source={update_source} ts={ts} "
-            f"uid={rec.get('uid')} has_measure={has_measure} last_snap_ts={rec.get('last_snap_ts')}",
+            f"uid={rec.get('uid')} has_measure={has_measure} "            
+            f"temperature={rec.get('temperature')} "
+            f"last_snap_ts={rec.get('last_snap_ts')}",
             flush=True,
         )
 
@@ -2592,49 +3682,20 @@ class CmdRouter:
             rec.get("uid"),
             rec.get("mac"),
         )
+
         if prev_sig != cur_sig and self.mqtt is not None:
             try:
-                self.publish_node_inventory(reason="uplink_seen")
+                if hasattr(self, "publish_node_inventory"):
+                    self.publish_node_inventory(reason="uplink_seen")
+                else:
+                    _verbose_print(
+                        "[INV] skip publish_node_inventory: method missing",
+                        flush=True,
+                    )
             except Exception as e:
                 print("[INV] publish error(uplink_seen):", e)
 
         return rec
-
-    def publish_node_inventory(self, reason: str = "mqtt_connect"):
-        nodes = self.store.all_nodes() if self.store is not None else []
-        now = int(time.time())
-
-        items = []
-        for r in nodes:
-            mid = int(r.get("mid") or 0)
-            if mid == 0:
-                continue
-            last_ts, online = self._node_inventory_meta(r, now=now)
-            status_info = self._wisun_status_info(mid, now=now, rec=r)
-            items.append({
-                "mid": mid,
-                "uid": r.get("uid"),
-                "mac": r.get("mac"),
-                **status_info,
-                "last_ts": last_ts,
-                "comm_health": self._comm_health_payload(mid, now=now, rec=r),
-            })
-
-        # mid 기준 정렬(보기 좋게)
-        items.sort(key=lambda x: x["mid"])
-
-        payload = {
-            "cmd": "node_inventory",
-            "gid": self.gwid,
-            "ts": int(time.time()),
-            "reason": reason,
-            "nodes": items,
-            "count": len(items),
-        }
-
-        topic = f"gw/{self.gwid}/mid_lists"  
-        self.mqtt.publish_json(topic, payload)
-        _verbose_print(f"[MQTT TX INVENTORY] topic={topic} count={len(items)}")
 
 
     def on_node_inventory(self, payload: dict):
@@ -2644,12 +3705,11 @@ class CmdRouter:
         ts = payload.get("ts")
         gid = payload.get("gid")
 
-        # 여기서 nodes_store.bin 또는 in-memory store seed/update
+        # 여기서 nodes_store.bin 
         # self.store.seed_inventory(gid, nodes, ts=ts, reason=reason)
         _verbose_print(f"[INV] seed ok gid={gid} count={len(nodes)} reason={reason} ts={ts}")
 
-    def _publish_node_ack(self, api_cmd: str, resp: dict):
-        # 네 규칙대로 topic을 맞춰
+    def _publish_node_ack(self, api_cmd: str, resp: dict):        
         topic = f"node/{self.gwid}/response/{api_cmd}"
         self.mqtt.publish_json(topic, resp)
         _verbose_print("[MQTT TX ACK]", topic, resp)
@@ -2702,6 +3762,25 @@ class CmdRouter:
         for expired in expired_items:
             if expired.get("want") != "ack":
                 continue
+            meta = expired.get("meta") or {}
+            batch_id = meta.get("batch_id")
+            if batch_id:
+                self._batch_record_node_result(
+                    batch_id,
+                    mid,
+                    result="timeout",
+                    node_msg_id=expired.get("tx_msg_id"),
+                    ts=int(time.time()),
+                    reason="timeout",
+                )
+                self._comm_mark_error(
+                    mid,
+                    "response_timeout",
+                    detail=f"api={expired.get('api')} batch_id={batch_id}",
+                    count_field="timeout_count",
+                    mark_pending=True,
+                )
+                continue
             self._ack_fail(expired["api"], expired.get("srv_msg_id"), mid, "timeout")
             self._comm_mark_error(
                 mid,
@@ -2732,7 +3811,7 @@ class CmdRouter:
                 q.rotate(-1)
             return None
 
-        # tx_msg_id로 정확 매칭
+        # tx_msg_id로 정확히 매칭
         for _ in range(len(q)):
             item = q[0]
             if item.get("want") == "ack" and item.get("tx_msg_id") == tx_msg_id:
@@ -2762,6 +3841,8 @@ class CmdRouter:
             self._stop_event.wait(wait_sec)
             if self._stop_event.is_set():
                 break
+            if not self.store_snap_batch_enabled:
+                continue
             try:
                 self._publish_snap_batch()
             except Exception as e:
@@ -2811,7 +3892,6 @@ class CmdRouter:
             key=lambda r: ((r.get("mid") or 0), (r.get("uid") or ""))
         )
 
-        # reg(심박/마지막 접속시간) 같은 걸로 online 여부 판별 가능하면 같이 붙이기
         nodes_payload = []
         for r in nodes_sorted:
             mid = r.get("mid")
@@ -2857,8 +3937,7 @@ class CmdRouter:
             "cmd": "get_all_status",
             "gid": self.gwid,
             "ts": now,
-            "nodes": nodes_payload,
-            # 필요하면 요청 쪽 msg_id / rqid 같은 것도 그대로 되돌려주기
+            "nodes": nodes_payload,            
             "msg_id": req.get("msg_id"),
         }
 
@@ -2875,8 +3954,7 @@ class CmdRouter:
         if self.store is None:
             return
 
-        # 배치 전송은 pending 여부와 무관하게 현재 저장된 전체 노드 상태를
-        # 설정된 주기마다 다시 publish한다.
+        # 배치 전송은 pending 여부와 무관하게 현재 저장된 전체 노드 상태를 설정된 주기마다 다시 publish한다. 
         nodes = self.store.all_nodes()
         if not nodes:
             return
@@ -2885,8 +3963,7 @@ class CmdRouter:
 
         # 이번 라운드에서 스냅을 보낸 노드 목록 (mid 집합)
         with self._snap_cycle_lock:
-            seen_mids = set(self._snap_cycle_seen_mids)
-            # 새 라운드를 위해 초기화
+            seen_mids = set(self._snap_cycle_seen_mids)            
             self._snap_cycle_seen_mids.clear()
             self._snap_cycle_start_ts = now
 
@@ -2899,8 +3976,7 @@ class CmdRouter:
         nodes_payload = []
         for r in nodes_sorted:
             mid = r.get("mid")
-            uid = r.get("uid")
-            # 이번 라운드에서 보고했는지 여부
+            uid = r.get("uid")            
             last_ts = int(r.get("ts") or 0)
             last_snap_ts = int(r.get("last_snap_ts") or 0)
             last_age_sec = None if last_ts <= 0 else max(0, now - last_ts)
@@ -2968,13 +4044,111 @@ class CmdRouter:
             "nodes": nodes_payload,
         }
 
-        topic_batch = f"node/{self.gwid}/snap"
+        topic_batch = f"node/{self.gwid}/snap_batch"
         self.mqtt.publish_json(topic_batch, payload)
         self.store.mark_sent_for_mids(
             [int(node.get("mid") or 0) for node in nodes_payload],
             sent_ts=now,
         )
         print(f"[MQTT TX SNAP_BATCH] topic={topic_batch} payload={payload}", flush=True)
+
+    def _publish_direct_node_snap(
+        self,
+        *,
+        mid: int,
+        uid,
+        mac=None,
+        ts: int | None = None,
+        voltage=None,
+        current=None,
+        temperature=None,
+        light_on=None,
+        fft=None,
+        ai_valid=None,
+        ai_mse=None,
+        ai_pred=None,
+        measurement_source: str = "uplink_direct",
+        extra: dict | None = None,
+    ):
+        if not self.direct_uplink_publish or self.mqtt is None:
+            return
+
+        now = int(ts if ts is not None else time.time())
+        try:
+            mid_int = int(mid or 0)
+        except (TypeError, ValueError):
+            mid_int = 0
+        if mid_int <= 0:
+            return
+
+        clean = _sanitize_node_measurements(
+            voltage=voltage,
+            current=current,
+            temperature=temperature,
+            light_on=light_on,
+            fft=fft,
+        )
+        clean_ai = _sanitize_ai_result(
+            ai_valid=ai_valid,
+            ai_mse=ai_mse,
+            ai_pred=ai_pred,
+        )
+        rec = {
+            "mid": mid_int,
+            "uid": uid,
+            "mac": mac,
+            "voltage": clean["voltage"],
+            "current": clean["current"],
+            "temperature": clean["temperature"],
+            "light_on": clean["light_on"],
+            "fft": clean["fft"],
+            "ai_valid": clean_ai["ai_valid"],
+            "ai_mse": clean_ai["ai_mse"],
+            "ai_pred": clean_ai["ai_pred"],
+            "ts": now,
+            "last_ts": now,
+            "last_snap_ts": now,
+            "last_good_measurement_ts": now,
+        }
+        status_info = self._wisun_status_info(mid_int, now=now, rec=rec)
+        node_obj = {
+            "mid": mid_int,
+            "uid": uid,
+            "mac": mac,
+            "last_ts": now,
+            "last_snap_ts": now,
+            "last_good_measurement_ts": now,
+            "last_age_sec": 0,
+            "snap_age_sec": 0,
+            **status_info,
+            "pending_send": 0,
+            "status": "ok",
+            "comm_health": self._comm_health_payload(mid_int, now=now, rec=rec),
+            "data": {
+                "voltage": clean["voltage"],
+                "current": clean["current"],
+                "temperature": clean["temperature"],
+                "light_on": clean["light_on"],
+                "fft": clean["fft"],
+                "ai_valid": clean_ai["ai_valid"],
+                "ai_mse": clean_ai["ai_mse"],
+                "ai_pred": clean_ai["ai_pred"],
+                "measurement_source": measurement_source,
+            },
+        }
+        if extra:
+            node_obj["uplink"] = extra
+
+        payload = {
+            "cmd": "snap_batch",
+            "gid": self.gwid,
+            "ts": now,
+            "source": "uplink_direct",
+            "nodes": [node_obj],
+        }
+        topic = f"node/{self.gwid}/snap"
+        self.mqtt.publish_json(topic, payload)
+        print(f"[MQTT TX DIRECT_SNAP] topic={topic} mid={mid_int} source={measurement_source}", flush=True)
 
     def _alloc_mid(self) -> int:
         m = self.next_mid
@@ -3003,6 +4177,17 @@ class CmdRouter:
             if isinstance(payload, (bytes, bytearray)):
                 b = bytes(payload)  
                 body = b
+                if len(body) == 1 and body[0] == CMD_SET_RTC_KST:
+                    self._handle_rtc_kst_request(
+                        mid=mid,
+                        ts=ts,
+                        node_msg_id=None,
+                        target_mid=None,
+                        flags=None,
+                        ttl=None,
+                        raw_hex=raw_hex,
+                    )
+                    return
                 if len(body) >= NODEINFO_SIZE and body[0] == T_NODEINFO_BIN:
                     info = parse_nodeinfo_bin(body)
                     self._remember_node_seen(
@@ -3030,7 +4215,7 @@ class CmdRouter:
                     self.mqtt.publish_json(topic_cmd("get_node_info"), resp)
                     _verbose_print("[MQTT TX GET_NODE_INFO_BIN]", resp)
                     return       
-                # 0) 먼저: transport header 없는 순수 Ack/Snap인지 체크 (가장 안전)
+                # transport header 없는 순수 Ack/Snap인지 체크 
                 if len(payload) >= ACK_BIN_SIZE and payload[0] in (ACK_T, ACK_NODE_CFG_T):
                     body = payload
                     target_mid = ttl = cmd_code = flags = None
@@ -3073,6 +4258,18 @@ class CmdRouter:
                         node_msg_id = (payload[5] << 8) | payload[6]
                         body        = payload[7:]
 
+                    if cmd_code == CMD_SET_RTC_KST and len(body) == 0:
+                        self._handle_rtc_kst_request(
+                            mid=mid,
+                            ts=ts,
+                            node_msg_id=node_msg_id,
+                            target_mid=target_mid,
+                            flags=flags,
+                            ttl=ttl,
+                            raw_hex=raw_hex,
+                        )
+                        return
+
                     if len(body) >= 1 and body[0] == T_SNAP:
                         post_freq0_hex = (
                             body[SNAP_POST_FREQ0_OFFSET:].hex(" ")
@@ -3100,13 +4297,14 @@ class CmdRouter:
                     if not (is_body_ack or is_body_snap or is_body_light_state or is_body_status or is_body_getch or is_body_info or is_body_rtc):
                         
                         if (ttl is not None and 1 <= ttl <= 20 and
-                            cmd_code is not None and cmd_code in (0x31,)):
+                            cmd_code is not None and cmd_code in (CMD_SET_SETTING, CMD_SET_ASTRO_SETTING)):
                             print(f"[GW] DROP echoed/downlink-like uplink mid={mid} "
                                 f"target_mid={target_mid} ttl={ttl} cmd=0x{cmd_code:02X} "
                                 f"len={len(payload)}")
                             _verbose_print("[GW] dropped echoed raw=", raw_hex)
                             return            
                 if len(body) >= LIGHT_STATE_EVENT_BIN_SIZE and body[0] == T_LIGHT_STATE_EVENT:
+                    event_rx_ts = int(ts if ts is not None else time.time())
                     try:
                         event = unpack_light_state_event_bin(body)
                         if event is None:
@@ -3139,40 +4337,28 @@ class CmdRouter:
                     valid_temp = bool(valid_flags & 0x04)
                     valid_fft = bool(valid_flags & 0x08)
                     valid_rtc = bool(valid_flags & 0x10) and "rtc_year" in event
+                    usable_measurements = _light_event_measurements_usable(event)
+                    if not usable_measurements:
+                        if valid_temp or valid_fft:
+                            print(
+                                f"[GW LIGHT_STATE_EVENT MEASURE_DROP] mid={mid} uid={uid_str} "
+                                f"flags=0x{valid_flags:02X} layout={event.get('parse_layout')} "
+                                f"score={event.get('parse_score')} temp_raw={event.get('temp')} "
+                                f"fft_count_raw={event.get('fft_count_raw', event.get('fft_count'))} "
+                                f"fft_pairs={event.get('fft_pairs')} body_hex={body.hex(' ')}",
+                                flush=True,
+                            )
+                        valid_temp = False
+                        valid_fft = False
 
                     light_on_val = event["light_on"] if valid_light else None
                     voltage_val = event["voltage"] if valid_vi else None
                     current_val = event["current"] if valid_vi else None
-                    temp_val = event["temp"]
-                    fft_val = [list(pair) for pair in event["fft_pairs"]]
+                    temp_val = event["temp"] if valid_temp else None
+                    fft_val = [list(pair) for pair in event["fft_pairs"]] if valid_fft else []
                     rtc_val = event.get("rtc") if valid_rtc else None
                     fallback_from_snap = []
-                    prev_rec = self._store_latest_by_mid(mid)
-                    fallback_measure = self._measurement_fallback(mid, prev_rec)
-                    if fallback_measure:
-                        temp_clean_now = _bounded_number(temp_val, "temperature")
-                        temp_looks_empty = (
-                            temp_clean_now is None
-                            or (
-                                valid_temp
-                                and abs(float(temp_clean_now)) < NODE_ZERO_EPS
-                                and abs(float(event["temp"])) < NODE_ZERO_EPS
-                            )
-                        )
-                        if temp_looks_empty and fallback_measure.get("temperature") is not None:
-                            temp_val = fallback_measure["temperature"]
-                            fallback_from_snap.append("temperature")
-
-                        if _fft_missing_value(fft_val) and fallback_measure.get("fft"):
-                            fft_val = fallback_measure["fft"]
-                            fallback_from_snap.append("fft")
-
-                    if fallback_from_snap:
-                        _verbose_print(
-                            f"[GW LIGHT_STATE_EVENT FALLBACK] mid={mid} uid={uid_str} "
-                            f"fields={fallback_from_snap} temp={temp_val} fft={fft_val}",
-                            flush=True,
-                        )
+                    fallback_ts = None
                     if self._should_drop_duplicate_uplink("light_state_event", mid, bytes(body)):
                         _verbose_print(
                             f"[GW DEDUPE] drop duplicate light_state_event mid={mid} "
@@ -3180,12 +4366,14 @@ class CmdRouter:
                             flush=True,
                         )
                         return
-                    _verbose_print(
+                    print(
                         f"[GW LIGHT_STATE_EVENT PARSED] mid={mid} uid={uid_str} "
+                        f"event_rx_ts={event_rx_ts} fallback_ts={fallback_ts} "
                         f"event_id={event['event_id']} flags=0x{valid_flags:02X} "
                         f"layout={event.get('parse_layout')} score={event.get('parse_score')} "
+                        f"offsets={event.get('parse_offsets')} "
                         f"valid_temp={valid_temp} valid_fft={valid_fft} "
-                        f"temp_raw={event['temp']} fft_count_raw={event['fft_count']} "
+                        f"temp_raw={event['temp']} fft_count_raw={event.get('fft_count_raw', event['fft_count'])} "
                         f"fft_raw={fft_val} rtc={rtc_val} body_hex={body.hex(' ')}",
                         flush=True,
                     )
@@ -3225,12 +4413,17 @@ class CmdRouter:
                             "fft": valid_fft,
                             "rtc": valid_rtc,
                         },
+                        "raw_valid_flags": valid_flags,
+                        "measurement_parse_ok": usable_measurements,
                         "light_on": clean["light_on"],
                         "mode": event["mode"],
                         "reason": event["reason"],
                         "tick_ms": event["tick_ms"],
                         "parse_layout": event.get("parse_layout"),
+                        "parse_score": event.get("parse_score"),
                         "fallback_from_snap": fallback_from_snap,
+                        "event_rx_ts": event_rx_ts,
+                        "fallback_ts": fallback_ts,
                         "ts": ts,
                         "temperature": clean["temperature"],
                         "fft_count": len(clean["fft"] or []),
@@ -3242,6 +4435,9 @@ class CmdRouter:
                             "fft_count": len(clean["fft"] or []),
                             "fft": clean["fft"] or [],
                             "fallback_from_snap": fallback_from_snap,
+                            "event_rx_ts": event_rx_ts,
+                            "fallback_ts": fallback_ts,
+                            "measurement_parse_ok": usable_measurements,
                             "rtc": rtc_val,
                             "rtc_synced": event.get("rtc_synced") if valid_rtc else None,
                         },
@@ -3341,8 +4537,37 @@ class CmdRouter:
                     return
                 # 1) AckBin (body[0] == 0x10)
                 if len(body) >= ACK_BIN_SIZE and body[0] in (ACK_T, ACK_NODE_CFG_T):
+                    ack_schedule = {}
                     try:
-                        t_val, uid_bytes, msg_id32, ok, err_code = struct.unpack(ACK_BIN_FMT, body[:ACK_BIN_SIZE])
+                        if body[0] == ACK_T and len(body) >= SET_SETTING_ACK_V2_SIZE:
+                            (
+                                t_val, uid_bytes, msg_id32, ok, err_code,
+                                ack_mode, ack_coord_type,
+                                ack_lat_e7, ack_lon_e7,
+                                ack_sunrise, ack_sunset, ack_dawn, ack_dusk,
+                                ack_on_min, ack_off_min,
+                            ) = struct.unpack(
+                                SET_SETTING_ACK_V2_FMT,
+                                body[:SET_SETTING_ACK_V2_SIZE],
+                            )
+                            ack_schedule = {
+                                "mode": int(ack_mode),
+                                "apply_coord_type": int(ack_coord_type),
+                                "applied_lat_e7": int(ack_lat_e7),
+                                "applied_lon_e7": int(ack_lon_e7),
+                                "sunrise_min": int(ack_sunrise),
+                                "sunset_min": int(ack_sunset),
+                                "dawn_min": int(ack_dawn),
+                                "dusk_min": int(ack_dusk),
+                                "on_time_min": None if int(ack_on_min) == 0xFFFF else int(ack_on_min),
+                                "off_time_min": None if int(ack_off_min) == 0xFFFF else int(ack_off_min),
+                            }
+                            if ack_schedule["on_time_min"] is not None:
+                                ack_schedule["on_time"] = f'{ack_schedule["on_time_min"] // 60:02d}:{ack_schedule["on_time_min"] % 60:02d}'
+                            if ack_schedule["off_time_min"] is not None:
+                                ack_schedule["off_time"] = f'{ack_schedule["off_time_min"] // 60:02d}:{ack_schedule["off_time_min"] % 60:02d}'
+                        else:
+                            t_val, uid_bytes, msg_id32, ok, err_code = struct.unpack(ACK_BIN_FMT, body[:ACK_BIN_SIZE])
                     except struct.error as e:
                         print("[GW] AckBin unpack error:", e, "len=", len(payload))
                         _verbose_print("[GW] AckBin raw=", raw_hex)
@@ -3373,6 +4598,28 @@ class CmdRouter:
 
                     pend = self._pending_pop_ack(mid, match_id)
                     api = pend["api"] if pend else "unknown"
+                    pend_meta = pend.get("meta") if pend else {}
+                    batch_id = (pend_meta or {}).get("batch_id")
+                    if batch_id:
+                        self._batch_record_node_result(
+                            batch_id,
+                            mid,
+                            result=result,
+                            node_msg_id=match_id,
+                            err_code=int(err_code),
+                            uid=uid_str,
+                            ts=ts,
+                            ack_data=ack_schedule,
+                        )
+                        self.log.info(
+                            "UL batch ack api=%s batch=%s mid=%d node_msg_id=%s result=%s err=%d",
+                            api, batch_id, mid, match_id, result, int(err_code)
+                        )
+                        _verbose_print(
+                            f"[BATCH ACK] api={api} batch_id={batch_id} mid={mid} "
+                            f"node_msg_id={match_id} result={result} err={int(err_code)}"
+                        )
+                        return
 
                     resp = {
                         "cmd": f"{api}_ack",
@@ -3385,7 +4632,7 @@ class CmdRouter:
                         "err_code": int(err_code),
                         "ts": ts,
 
-                        # 디버깅용(원하면)
+                        # 디버깅용
                         "rx_target_mid": target_mid,
                         "rx_cmd": cmd_code,
                         "rx_flags": flags,
@@ -3393,6 +4640,8 @@ class CmdRouter:
                     }
                     if pend and pend.get("meta"):
                         resp.update(pend["meta"])
+                    if ack_schedule:
+                        resp.update(ack_schedule)
 
                     self.mqtt.publish_json(topic_cmd(api), resp)
                     self.log.info("UL ack api=%s mid=%d node_msg_id=%s result=%s err=%d",
@@ -3440,8 +4689,7 @@ class CmdRouter:
 
                     # match_id 규칙: transport header의 node_msg_id가 있으면 그걸 우선
                     match_id = int(node_msg_id) if node_msg_id is not None else int(status["msg_id32"] & 0xFFFF)
-
-                    # pending에서 api를 뽑아오면 보통 "get_node_status"가 들어있게 됨
+                    
                     pend = self._pending_pop_ack(mid, match_id)   # 이름은 ack지만 "요청-응답 매칭" 용도로 재사용 가능
                     api = pend["api"] if pend else "get_node_status"
 
@@ -3486,7 +4734,7 @@ class CmdRouter:
                             "snap_count": status["snap_count"],
                         },
 
-                        # 디버깅용(원하면)
+                        # 디버깅용
                         "rx_target_mid": target_mid,
                         "rx_cmd": cmd_code,
                         "rx_flags": flags,
@@ -3526,9 +4774,54 @@ class CmdRouter:
                         })
                         return
 
-                    uid_str = snap["uid_bytes"].hex()
+                    uid_str = snap["uid_bytes"].hex()                    
                     fft1 = snap["fft_pairs"][0] if len(snap.get("fft_pairs", [])) >= 1 else (None, None)
                     fft2 = snap["fft_pairs"][1] if len(snap.get("fft_pairs", [])) >= 2 else (None, None)
+
+                    rx_mid = int(mid)
+
+                    # SNAP TTL 기반 relay drop                    
+                    if snap.get("ttl") is not None:
+                        snap_ttl = snap.get("ttl")
+                        if snap_ttl is not None and int(snap_ttl) != 3:
+                            print(
+                                f"[GW SNAP DROP HOP_TTL] rx_mid={rx_mid} uid={uid_str} "
+                                f"ttl={snap_ttl} snap_count={snap.get('snap_count')}",
+                                flush=True,
+                            )
+                            return
+
+                    # UID 소유 MID 기반 relay drop
+                    owner_mid = None
+                    if self.store is not None:
+                        try:
+                            for r in self.store.all_nodes():
+                                if not isinstance(r, dict):
+                                    continue
+
+                                r_uid = str(r.get("uid") or "").lower()
+                                if r_uid == uid_str.lower():
+                                    owner_mid = int(r.get("mid") or 0)
+                                    break
+
+                        except Exception as e:
+                            print(f"[GW SNAP OWNER_LOOKUP_ERR] uid={uid_str} err={e}", flush=True)
+                            owner_mid = None
+
+                    print(
+                        f"[GW SNAP OWNER CHECK] rx_mid={rx_mid} owner_mid={owner_mid} "
+                        f"uid={uid_str} ttl={snap.get('ttl')} snap_count={snap.get('snap_count')}",
+                        flush=True,
+                    )
+
+                    if owner_mid and owner_mid != rx_mid:
+                        print(
+                            f"[GW SNAP DROP RELAY] rx_mid={rx_mid} owner_mid={owner_mid} "
+                            f"uid={uid_str} ttl={snap.get('ttl')} snap_count={snap.get('snap_count')}",
+                            flush=True,
+                        )
+                        return
+
                     if self._should_drop_duplicate_uplink("snap", mid, bytes(body)):
                         _verbose_print(
                             f"[GW DEDUPE] drop duplicate snap mid={mid} uid={uid_str} "
@@ -3539,6 +4832,7 @@ class CmdRouter:
                     print(
                         f"[GW RAW_PARSE SNAP] mid={mid} uid={uid_str} "
                         f"layout={snap.get('layout')} "
+                        f"ttl={snap.get('ttl')} "
                         f"body_hex={body.hex(' ')} "
                         f"tail_valid={snap.get('tail_valid')} "
                         f"light_on={snap.get('light_on')} "
@@ -3548,19 +4842,54 @@ class CmdRouter:
                         f"snap_count={snap.get('snap_count')} msg_id32={snap.get('msg_id32')} "
                         f"ok={snap.get('ok')} err={snap.get('err_code')} "
                         f"ai_valid={snap.get('ai_valid')} ai_mse={snap.get('ai_mse')} "
-                        f"ai_pred={snap.get('ai_pred')} flags={snap.get('flags')}",
+                        f"ai_pred={snap.get('ai_pred')} flags={snap.get('flags')} "
+                        f"control_mode={snap.get('control_mode')} "
+                        f"on_time_min={snap.get('on_time_min')} off_time_min={snap.get('off_time_min')}",
                         flush=True,
                     )
 
                     use_snap_head = _fallback_snap_head_usable(snap)
                     fft = []
+
                     if use_snap_head and snap["fft_count"] >= 1:
                         f1, a1 = snap["fft_pairs"][0]
-                        fft.append([f1, a1 if (snap.get("tail_valid") or snap.get("a1_valid")) else None])
+
+                        try:
+                            f1_float = float(f1)
+                        except (TypeError, ValueError):
+                            f1_float = 0.0
+
+                        if f1_float > 0.0:
+                            fft.append([
+                                f1,
+                                a1 if (snap.get("tail_valid") or snap.get("a1_valid")) else None
+                            ])
+                        else:
+                            _verbose_print(
+                                f"[GW SNAP FFT DROP] mid={mid} uid={uid_str} "
+                                f"reason=zero_freq f1={f1} a1={a1}",
+                                flush=True,
+                            )
+
                     if use_snap_head and snap.get("tail_valid") and snap["fft_count"] >= 2:
                         f2, a2 = snap["fft_pairs"][1]
-                        fft.append([f2, a2])
-                    if use_snap_head and _fft_missing_value(fft):
+
+                        try:
+                            f2_float = float(f2)
+                        except (TypeError, ValueError):
+                            f2_float = 0.0
+
+                        if f2_float > 0.0:
+                            fft.append([f2, a2])
+                        else:
+                            _verbose_print(
+                                f"[GW SNAP FFT DROP] mid={mid} uid={uid_str} "
+                                f"reason=zero_freq f2={f2} a2={a2}",
+                                flush=True,
+                            )                    
+                    # fft=[]이면 초음파 없음 상태로 본다.
+                    # 이때 fallback을 붙이면 이전 초음파 값이 다시 살아날 수 있으므로 막는다.
+                    if use_snap_head and fft and _fft_missing_value(fft):
                         prev_rec = self._store_latest_by_mid(mid)
                         fallback_measure = self._measurement_fallback(mid, prev_rec)
                         merged_fft = _merge_fft_missing_values(fft, fallback_measure.get("fft"))
@@ -3571,6 +4900,21 @@ class CmdRouter:
                                 flush=True,
                             )
                             fft = merged_fft
+
+                    clean_dbg = _sanitize_node_measurements(
+                        voltage=snap["volt"] if use_snap_head else None,
+                        current=snap["curr"] if use_snap_head else None,
+                        temperature=snap["temp"] if use_snap_head else None,
+                        light_on=snap["light_on"] if use_snap_head else None,
+                        fft=fft,
+                    )
+
+                    print(
+                        f"[GW SNAP VALUES] mid={mid} uid={uid_str} "
+                        f"raw_temp={snap.get('temp')} clean_temp={clean_dbg.get('temperature')} "
+                        f"raw_fft={fft} clean_fft={clean_dbg.get('fft')}",
+                        flush=True,
+                    )
 
                     self._remember_node_seen(
                         mid=mid,
@@ -3586,6 +4930,40 @@ class CmdRouter:
                         ai_mse=snap.get("ai_mse"),
                         ai_pred=snap.get("ai_pred"),
                     )
+                    self._publish_direct_node_snap(
+                        mid=mid,
+                        ts=ts,
+                        uid=uid_str,
+                        mac=mac,
+                        voltage=snap["volt"] if use_snap_head else None,
+                        current=snap["curr"] if use_snap_head else None,
+                        temperature=snap["temp"] if use_snap_head else None,
+                        light_on=snap["light_on"] if use_snap_head else None,
+                        fft=fft,
+                        ai_valid=snap.get("ai_valid"),
+                        ai_mse=snap.get("ai_mse"),
+                        ai_pred=snap.get("ai_pred"),
+                        measurement_source="uplink_snap_bin",
+                        extra={
+                            "snap_count": snap.get("snap_count"),
+                            "msg_id32": snap.get("msg_id32"),
+                            "layout": snap.get("layout"),
+                            "tail_valid": snap.get("tail_valid"),
+                            "ok": snap.get("ok"),
+                            "err_code": snap.get("err_code"),
+                            "control_mode": snap.get("control_mode"),
+                            "on_time_min": snap.get("on_time_min"),
+                            "off_time_min": snap.get("off_time_min"),
+                            "on_time": (
+                                f'{snap["on_time_min"] // 60:02d}:{snap["on_time_min"] % 60:02d}'
+                                if snap.get("on_time_min") is not None else None
+                            ),
+                            "off_time": (
+                                f'{snap["off_time_min"] // 60:02d}:{snap["off_time_min"] % 60:02d}'
+                                if snap.get("off_time_min") is not None else None
+                            ),
+                        },
+                    )
 
                     with self._snap_cycle_lock:
                         self._snap_cycle_seen_mids.add(mid)
@@ -3597,6 +4975,22 @@ class CmdRouter:
                     rtc_msg_id = int.from_bytes(body[13:17], "little", signed=False)
                     rtc_ok = int(body[17])
                     rtc_err = int(body[18])
+                    rx_mid = int(mid)
+                    
+                    rtc_fingerprint = (
+                        uid_str,
+                        int(rtc_msg_id),
+                        int(rtc_ok),
+                        int(rtc_err),
+                    )
+
+                    if self._should_drop_duplicate_global_uplink("rtc_kst_uplink", rtc_fingerprint):
+                        print(
+                            f"[GW RTC DROP DUP] rx_mid={mid} uid={uid_str} "
+                            f"msg_id={rtc_msg_id} ok={rtc_ok} err={rtc_err}",
+                            flush=True,
+                        )
+                        return
 
                     self._remember_node_seen(
                         mid=mid,
@@ -3738,6 +5132,25 @@ class CmdRouter:
                     current=msg.get("curr"),
                     temperature=msg.get("temp"),
                     fft=msg.get("fft"),
+                )
+                self._publish_direct_node_snap(
+                    mid=mid,
+                    ts=ts,
+                    uid=uid_str,
+                    mac=msg.get("mac") or mac,
+                    voltage=msg.get("volt"),
+                    current=msg.get("curr"),
+                    temperature=msg.get("temp"),
+                    light_on=msg.get("light_on"),
+                    fft=msg.get("fft"),
+                    ai_valid=msg.get("ai_valid"),
+                    ai_mse=msg.get("ai_mse"),
+                    ai_pred=msg.get("ai_pred"),
+                    measurement_source="uplink_snap_dict",
+                    extra={
+                        "snap_count": msg.get("snap_count"),
+                        "msg_id": msg.get("msg_id"),
+                    },
                 )
 
                 with self._snap_cycle_lock:

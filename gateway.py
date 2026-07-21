@@ -131,6 +131,24 @@ def main():
                 mid, payload, ts = pkt
                 mac = None
             p0 = payload[0] if isinstance(payload, (bytes, bytearray)) and len(payload) else 0
+            is_light_state_event = (
+                isinstance(payload, (bytes, bytearray))
+                and (
+                    (len(payload) >= 1 and payload[0] == 0x15)
+                    or (len(payload) >= 8 and payload[7] == 0x15)
+                )
+            )
+            if is_light_state_event:
+                dispatch_ts = int(time.time())
+                try:
+                    queue_delay_sec = max(0, dispatch_ts - int(ts))
+                except Exception:
+                    queue_delay_sec = None
+                print(
+                    f"[GW LIGHT_STATE_EVENT QUEUE] mid={mid} recv_ts={ts} "
+                    f"dispatch_ts={dispatch_ts} queue_delay_sec={queue_delay_sec}",
+                    flush=True,
+                )
             print(f"[GW] UL DISPATCH mid={mid} len={len(payload)} p0=0x{p0:02X} ts={ts}", flush=True)
 
             try:
@@ -162,8 +180,8 @@ def main():
             config_path="config/node_schedule.config"
         )
 
-        log.info("init mqtt client host=%s port=%d client_id=%s", "mqtt.hananet.co.kr", 8883, gid)
-        mqtt = MqttBridge(host="mqtt.hananet.co.kr", port=8883, client_id=gid, username=gid, scheduler=scheduler)
+        log.info("init mqtt client host=%s port=%d client_id=%s", "mqtt.hanax.ai", 8883, gid)
+        mqtt = MqttBridge(host="mqtt.hanax.ai", port=8883, client_id=gid, username=gid, scheduler=scheduler)
         mqtt.configure_tls_min12_from("/etc/mosquitto/certs", gid)
 
         reg = NodeRegistry()
@@ -173,8 +191,8 @@ def main():
 
         mqtt.add_handler(router.on_server_cmd)
 
-        log.info("mqtt connect begin host=%s port=%d", "mqtt.hananet.co.kr", 8883)
-        mqtt.connect("mqtt.hananet.co.kr", 8883)
+        log.info("mqtt connect begin host=%s port=%d", "mqtt.hanax.ai", 8883)
+        mqtt.connect("mqtt.hanax.ai", 8883)
         log.info("mqtt connected, loop_start()")
 
         mqtt.loop_start()

@@ -1,13 +1,26 @@
 # node_scheduler.py
 import json
+import os
 import time
+import math
 import threading
-from datetime import datetime, date, time as dt_time, timedelta
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, date, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from astral.sun import sun
-from astral import LocationInfo
-from zoneinfo import ZoneInfo
+try:
+    from astral.sun import sun
+    from astral import LocationInfo
+except Exception:
+    sun = None
+    LocationInfo = None
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 REGION_TABLE = {
     0: ("Default", 37.5665, 126.9780),   # 기본
@@ -26,11 +39,254 @@ REGION_TABLE = {
     13: ("Jeju", 33.4996, 126.5312),
 }
 
-KST = ZoneInfo("Asia/Seoul")
+def _load_kst():
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo("Asia/Seoul")
+        except Exception:
+            pass
+    return timezone(timedelta(hours=9), "KST")
+
+KST = _load_kst()
 CMD_SET_RTC_KST = 0x2B
 RTC_SYNC_BCAST_MID = 0x0000
 RTC_SYNC_PERIOD_MIN = 60
 RTC_SYNC_STARTUP_DELAY_SEC = 0.0
+GW_INFO_PATH = os.getenv("GW_INFO_PATH", "/home/pi/gw_info.json")
+KASI_RISESET_URL = os.getenv(
+    "KASI_RISESET_URL",
+    "http://apis.data.go.kr/B090041/openapi/service/RiseSetInfoService/getLCRiseSetInfo",
+)
+KASI_SERVICE_KEY = os.getenv("KASI_SERVICE_KEY") or os.getenv("DATA_GO_KR_SERVICE_KEY") or ""
+try:
+    KASI_API_TIMEOUT_SEC = float(os.getenv("KASI_API_TIMEOUT_SEC", "5.0") or 5.0)
+except (TypeError, ValueError):
+    KASI_API_TIMEOUT_SEC = 5.0
+
+def _minutes_since_midnight(value: datetime) -> int:
+    local = value.astimezone(KST)
+    return (local.hour * 60) + local.minute
+
+def _read_gateway_gps(path: str = GW_INFO_PATH) -> Optional[tuple[float, float]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+
+    gps = data.get("gps") if isinstance(data, dict) else None
+    if not isinstance(gps, dict):
+        return None
+
+    try:
+        lat = float(gps.get("lat"))
+        lon = float(gps.get("lon"))
+    except (TypeError, ValueError):
+        return None
+
+    if math.isfinite(lat) and math.isfinite(lon) and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+        return lat, lon
+    return None
+
+def _hhmm_to_min(value) -> Optional[int]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s in ("-", "----"):
+        return None
+    s = "".join(ch for ch in s if ch.isdigit())
+    if not s:
+        return None
+    s = s.zfill(4)
+    try:
+        hour = int(s[:-2])
+        minute = int(s[-2:])
+    except ValueError:
+        return None
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return (hour * 60) + minute
+    return None
+
+def _kasi_result_to_sun_min(item: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    if not isinstance(item, dict):
+        return None
+    keys = {
+        "sunrise_min": ("sunrise", "sunriseTime"),
+        "sunset_min": ("sunset", "sunsetTime"),
+        "dawn_min": ("civilm", "civilMorning", "dawn"),
+        "dusk_min": ("civile", "civilEvening", "dusk"),
+    }
+    result = {}
+    for out_key, candidates in keys.items():
+        value = None
+        for candidate in candidates:
+            if candidate in item:
+                value = _hhmm_to_min(item.get(candidate))
+                if value is not None:
+                    break
+        if value is None:
+            return None
+        result[out_key] = value
+    return result
+
+def _first_kasi_json_item(data) -> Optional[Dict[str, Any]]:
+    try:
+        item = data["response"]["body"]["items"]["item"]
+    except (TypeError, KeyError):
+        return None
+    if isinstance(item, list):
+        return item[0] if item else None
+    return item if isinstance(item, dict) else None
+
+def _first_kasi_xml_item(text: str) -> Optional[Dict[str, Any]]:
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    item = root.find(".//item")
+    if item is None:
+        return None
+    return {child.tag: (child.text or "").strip() for child in list(item)}
+
+def _build_kasi_url(day: date, lat: float, lon: float, service_key: str) -> str:
+    params = {
+        "locdate": day.strftime("%Y%m%d"),
+        "latitude": f"{lat:.6f}",
+        "longitude": f"{lon:.6f}",
+        "dnYn": "N",
+        "_type": "json",
+    }
+    query = urllib.parse.urlencode(params)
+    encoded_key = service_key if "%" in service_key else urllib.parse.quote(service_key, safe="")
+    return f"{KASI_RISESET_URL}?serviceKey={encoded_key}&{query}"
+
+def _fetch_kasi_sun_min_payload(day: date, lat: float, lon: float) -> Optional[Dict[str, int]]:
+    service_key = KASI_SERVICE_KEY.strip()
+    if not service_key:
+        return None
+
+    url = _build_kasi_url(day, lat, lon, service_key)
+    try:
+        with urllib.request.urlopen(url, timeout=KASI_API_TIMEOUT_SEC) as resp:
+            body = resp.read(65536)
+            charset = resp.headers.get_content_charset() or "utf-8"
+        text = body.decode(charset, errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        print(f"[SCHED] KASI rise/set API failed, fallback to local calculation: {e}")
+        return None
+
+    try:
+        data = json.loads(text)
+        item = _first_kasi_json_item(data)
+    except json.JSONDecodeError:
+        item = _first_kasi_xml_item(text)
+
+    result = _kasi_result_to_sun_min(item or {})
+    if result is None:
+        print("[SCHED] KASI rise/set API response parse failed, fallback to local calculation")
+    return result
+
+def _solar_event(day: date, lat: float, lon: float, zenith: float, sunrise: bool) -> datetime:
+    n = day.timetuple().tm_yday
+    lng_hour = lon / 15.0
+    approx_hour = 6.0 if sunrise else 18.0
+    t = n + ((approx_hour - lng_hour) / 24.0)
+
+    mean_anomaly = (0.9856 * t) - 3.289
+    true_long = (
+        mean_anomaly
+        + (1.916 * math.sin(math.radians(mean_anomaly)))
+        + (0.020 * math.sin(math.radians(2 * mean_anomaly)))
+        + 282.634
+    ) % 360.0
+
+    right_ascension = math.degrees(math.atan(0.91764 * math.tan(math.radians(true_long)))) % 360.0
+    long_quadrant = math.floor(true_long / 90.0) * 90.0
+    ra_quadrant = math.floor(right_ascension / 90.0) * 90.0
+    right_ascension = (right_ascension + (long_quadrant - ra_quadrant)) / 15.0
+
+    sin_dec = 0.39782 * math.sin(math.radians(true_long))
+    cos_dec = math.cos(math.asin(sin_dec))
+    cos_hour = (
+        math.cos(math.radians(zenith)) - (sin_dec * math.sin(math.radians(lat)))
+    ) / (cos_dec * math.cos(math.radians(lat)))
+    cos_hour = max(-1.0, min(1.0, cos_hour))
+
+    hour_angle = math.degrees(math.acos(cos_hour))
+    if sunrise:
+        hour_angle = 360.0 - hour_angle
+    hour_angle /= 15.0
+
+    local_mean = hour_angle + right_ascension - (0.06571 * t) - 6.622
+    utc_hour = (local_mean - lng_hour) % 24.0
+    event_utc = datetime.combine(day, dt_time(0, 0), tzinfo=timezone.utc) + timedelta(hours=utc_hour)
+    return event_utc.astimezone(KST)
+
+def _sun_times_for_location(name: str, lat: float, lon: float, day: date) -> Dict[str, datetime]:
+    if sun is not None and LocationInfo is not None:
+        loc = LocationInfo(name=name, region="KR", timezone="Asia/Seoul", latitude=lat, longitude=lon)
+        s = sun(loc.observer, date=day, tzinfo=loc.timezone)
+        return {
+            "sunrise": s["sunrise"],
+            "sunset": s["sunset"],
+            "dawn": s["dawn"],
+            "dusk": s["dusk"],
+        }
+
+    return {
+        "sunrise": _solar_event(day, lat, lon, 90.833, True),
+        "sunset": _solar_event(day, lat, lon, 90.833, False),
+        "dawn": _solar_event(day, lat, lon, 96.0, True),
+        "dusk": _solar_event(day, lat, lon, 96.0, False),
+    }
+
+def _sun_times_for_region(region_code: int, day: date) -> Dict[str, datetime]:
+    name, lat, lon = REGION_TABLE.get(region_code, REGION_TABLE[0])
+    return _sun_times_for_location(name, lat, lon, day)
+
+def _calc_sun_min_payload(region_code: int, day: date,
+                          gps: Optional[tuple[float, float]] = None) -> Dict[str, int]:
+    if gps is not None:
+        lat, lon = gps
+        kasi = _fetch_kasi_sun_min_payload(day, lat, lon)
+        if kasi is not None:
+            return kasi
+        s = _sun_times_for_location("GPS", lat, lon, day)
+    else:
+        _name, lat, lon = REGION_TABLE.get(region_code, REGION_TABLE[0])
+        kasi = _fetch_kasi_sun_min_payload(day, lat, lon)
+        if kasi is not None:
+            return kasi
+        s = _sun_times_for_region(region_code, day)
+    return {
+        "sunrise_min": _minutes_since_midnight(s["sunrise"]),
+        "sunset_min": _minutes_since_midnight(s["sunset"]),
+        "dawn_min": _minutes_since_midnight(s["dawn"]),
+        "dusk_min": _minutes_since_midnight(s["dusk"]),
+    }
+
+def build_rtc_kst_payload_with_sun_minutes(when: datetime, region_code: int = 0,
+                                           gps: Optional[tuple[float, float]] = None) -> bytes:
+    now = when.astimezone(KST)
+    year = int(now.year)
+    sun_min = _calc_sun_min_payload(region_code, now.date(), gps)
+    return bytes([
+        (year >> 8) & 0xFF,
+        year & 0xFF,
+        now.month & 0xFF,
+        now.day & 0xFF,
+        now.hour & 0xFF,
+        now.minute & 0xFF,
+        now.second & 0xFF,
+        (sun_min["sunrise_min"] >> 8) & 0xFF,
+        sun_min["sunrise_min"] & 0xFF,
+        (sun_min["sunset_min"] >> 8) & 0xFF,
+        sun_min["sunset_min"] & 0xFF,
+        (sun_min["dawn_min"] >> 8) & 0xFF,
+        sun_min["dawn_min"] & 0xFF,
+        (sun_min["dusk_min"] >> 8) & 0xFF,
+        sun_min["dusk_min"] & 0xFF,
+    ])
 
 class NodeScheduler:
 
@@ -177,16 +433,35 @@ class NodeScheduler:
 
     def _build_rtc_sync_payload(self, when: Optional[datetime] = None) -> bytes:
         now = when.astimezone(KST) if when is not None else self._now_kst()
-        year = int(now.year)
-        return bytes([
-            (year >> 8) & 0xFF,
-            year & 0xFF,
-            now.month & 0xFF,
-            now.day & 0xFF,
-            now.hour & 0xFF,
-            now.minute & 0xFF,
-            now.second & 0xFF,
-        ])
+        region_code = self._region_code_for_target(RTC_SYNC_BCAST_MID)
+        return build_rtc_kst_payload_with_sun_minutes(now, region_code, _read_gateway_gps())
+
+    def _region_code_for_target(self, target_mid: int = RTC_SYNC_BCAST_MID) -> int:
+        target_mid = int(target_mid or 0)
+
+        for sch in self._merge_schedules_for_apply():
+            target = sch.get("target") or {"type": "broadcast"}
+            target_type = str(target.get("type", "broadcast")).lower()
+            target_id = target.get("id")
+            if target_mid == RTC_SYNC_BCAST_MID and target_type == "broadcast":
+                return int(sch.get("region_code", 0) or 0)
+            if target_mid != RTC_SYNC_BCAST_MID and target_id is not None:
+                try:
+                    if int(target_id) == target_mid:
+                        return int(sch.get("region_code", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+
+        return 0
+
+    def build_rtc_sync_payload(self, when: Optional[datetime] = None,
+                               target_mid: int = RTC_SYNC_BCAST_MID) -> bytes:
+        now = when.astimezone(KST) if when is not None else self._now_kst()
+        return build_rtc_kst_payload_with_sun_minutes(
+            now,
+            self._region_code_for_target(target_mid),
+            _read_gateway_gps(),
+        )
 
     def sync_rtc_kst_broadcast(self, when: Optional[datetime] = None) -> None:
         now = when.astimezone(KST) if when is not None else self._now_kst()
@@ -239,16 +514,7 @@ class NodeScheduler:
                 print(f"[SCHED] failed to broadcast daily rtc sync: {e}")
 
     def calc_sun_times(self,region_code: int, date: datetime.date):
-        name, lat, lon = REGION_TABLE.get(region_code, REGION_TABLE[0])
-        loc = LocationInfo(name=name, region="KR", timezone="Asia/Seoul", latitude=lat, longitude=lon)
-        s = sun(loc.observer, date=date, tzinfo=loc.timezone)
-
-        return {
-            "sunrise": s["sunrise"],
-            "sunset": s["sunset"],
-            "dawn": s["dawn"],          # civil twilight 시작
-            "dusk": s["dusk"],          # civil twilight 종료
-        }
+        return _sun_times_for_region(region_code, date)
              
     def compute_onoff_times(self,profile: dict, region_code: int):
         light = profile.get("light", {})

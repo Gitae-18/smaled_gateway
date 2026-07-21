@@ -190,6 +190,7 @@ class NodeStore:
             last_good_temperature: Optional[float] = None,
             last_good_fft: Optional[Sequence[Sequence[float]]] = None,
             last_good_measurement_ts: Optional[float] = None,
+            #clear_temperature: bool = False,
         ) -> Dict[str, Any]:
 
         if uid is not None and not self._is_valid_uid(uid):
@@ -202,7 +203,7 @@ class NodeStore:
 
         with self._lock:
             old = self._by_key.get(key, {})
-
+        
             rec: Dict[str, Any] = {
                 "uid": uid if uid is not None else old.get("uid"),
                 "mid": mid if mid is not None else old.get("mid"),
@@ -212,6 +213,11 @@ class NodeStore:
                 ),
                 "voltage": voltage if voltage is not None else old.get("voltage"),
                 "current": current if current is not None else old.get("current"),
+                """ "temperature": (
+                    None if clear_temperature
+                    else temperature if temperature is not None
+                    else old.get("temperature")
+                ), """
                 "temperature": (
                     temperature if temperature is not None else old.get("temperature")
                 ),
