@@ -22,8 +22,16 @@ def _verbose_print(*args, **kwargs):
         print(*args, **kwargs)
 
 CMD_SNAP = 0x13 
+CMD_PERIODIC_SNAP_REPORT = 0x12
+CMD_REPORT_ACK = 0x16
+CMD_SETTING_ACK_TRANSPORT = 0x7E
 CMD_SET_MID_CH = 0x21
 CMD_SET_SETTING = 0x31
+SET_SETTING_INTERVAL_DEFAULT_SEC = 60
+SET_SETTING_INTERVAL_MAX_SEC = 0xFFFF
+SET_SETTING_PAYLOAD_SIZE = 32
+SET_SETTING_SNAP_PERIOD_OFFSET = 18
+SET_SETTING_AI_PERIOD_OFFSET = 30
 CMD_GET_FFT   = 0x27
 CMD_GET_UID   = 0x22
 CMD_GET_CH    = 0x24
@@ -67,14 +75,27 @@ SNAP_BIN_SIZE = SNAP_BIN_SIZE_NO_TTL
 SNAP_POST_FREQ0_OFFSET = struct.calcsize("<B12sfffBI")
 
 ACK_T = 0x10
+SET_SETTING_ACK_T = 0x31  # 설정 ACK 신규 형식 호환
 ACK_NODE_CFG_T = 0x20
 ACK_BIN_FMT = "<B12sIBb"
 ACK_BIN_SIZE = struct.calcsize(ACK_BIN_FMT)
+LIGHT_OFF_ACK_T = 0x32
+LIGHT_ON_ACK_T = 0x33
+LIGHT_ACK_TYPES = (LIGHT_OFF_ACK_T, LIGHT_ON_ACK_T)
+POWER_CTRL_ACK_TIMEOUT_SEC = 3.0
+POWER_CTRL_MAX_ATTEMPTS = 3
+POWER_CTRL_ACK_FMT = "<B12sIBbB"
+POWER_CTRL_ACK_SIZE = struct.calcsize(POWER_CTRL_ACK_FMT)
+ACK_TYPES = (ACK_T, SET_SETTING_ACK_T, ACK_NODE_CFG_T, LIGHT_OFF_ACK_T, LIGHT_ON_ACK_T)
 SET_SETTING_ACK_V2_FMT = "<B12sIBbBBiiHHHHHH"
 SET_SETTING_ACK_V2_SIZE = struct.calcsize(SET_SETTING_ACK_V2_FMT)
 
 SNAP_COMPACT_V2_FMT = "<BB12sfffBIIHHBBHH"
 SNAP_COMPACT_V2_SIZE = struct.calcsize(SNAP_COMPACT_V2_FMT)
+
+# Compact SNAP V3 = V2 + RUL percent x100 (uint16, little-endian)
+SNAP_COMPACT_V3_FMT = "<BB12sfffBIIHHBBHHH"
+SNAP_COMPACT_V3_SIZE = struct.calcsize(SNAP_COMPACT_V3_FMT)
 
 STATUS_T = 0x02
 STATUS_BIN_FMT_V1 = "<B12sfffBIBb"
@@ -97,6 +118,8 @@ NODEINFO_FMT = "<B12sHBBHBBBBBB8sHH"   # Little-endian, packed
 NODEINFO_SIZE = struct.calcsize(NODEINFO_FMT)
 
 ENV_KEYS = ("temp","humi","pm1","pm25","pm10","co2","voc","ch2o","co","o3","no2","ax","ay","az")
+ENV_ERROR_VALUE = -999
+ENV_STALE_AFTER_SEC = 10
 def read_env_latest(path="/home/pi/config/env_latest.json"):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -146,6 +169,42 @@ def _extract_env_values(latest: dict) -> dict:
         if "ts" in latest:
             env_values["ts"] = latest["ts"]
     return env_values
+
+def _env_error_values(latest=None) -> dict:
+    values = {k: ENV_ERROR_VALUE for k in ENV_KEYS}
+    if isinstance(latest, dict) and latest.get("ts") is not None:
+        values["ts"] = latest["ts"]
+    return values
+
+def _prepare_env_values(latest: dict, now_ts: int,
+                        max_age_sec: int = ENV_STALE_AFTER_SEC):
+    """Return (values, ok, reason, age_sec) for MQTT publication."""
+    if not isinstance(latest, dict):
+        return _env_error_values(), False, "cache_unavailable", None
+
+    sensor_ts = latest.get("ts")
+    try:
+        sensor_ts = int(sensor_ts)
+        age_sec = max(0, int(now_ts) - sensor_ts)
+    except (TypeError, ValueError, OverflowError):
+        return _env_error_values(latest), False, "missing_or_invalid_ts", None
+
+    if age_sec > int(max_age_sec):
+        return _env_error_values(latest), False, "stale", age_sec
+
+    values = _extract_env_values(latest)
+    if any(k not in values for k in ENV_KEYS):
+        return _env_error_values(latest), False, "incomplete", age_sec
+
+    try:
+        has_sensor_error = any(float(values[k]) == ENV_ERROR_VALUE for k in ENV_KEYS)
+    except (TypeError, ValueError, OverflowError):
+        return _env_error_values(latest), False, "invalid_value", age_sec
+
+    if has_sensor_error:
+        return values, False, "sensor_read_error", age_sec
+
+    return values, True, "normal", age_sec
 
 def _extract_gps_values(latest: dict) -> dict:
     if not isinstance(latest, dict):
@@ -351,11 +410,39 @@ def unpack_snap_bin(b: bytes):
     if b[0] != T_SNAP:
         return None
 
+    # 47 bytes: compact V3 + RUL percent x100
     # 45 bytes: compact V2 + control_mode/on_time_min/off_time_min
     # 40 bytes: compact V1
-    # 39 bytes: version + uid12 + values...
+    # 39 bytes: no-TTL legacy compact
+    rul_percent_x100 = None
+    rul_percent = None
+
     try:
-        if len(b) >= SNAP_COMPACT_V2_SIZE:
+        if len(b) >= SNAP_COMPACT_V3_SIZE:
+            (
+                t_val,
+                ttl,
+                uid_bytes,
+                volt,
+                curr,
+                temp,
+                light_on,
+                f1_x100,
+                a1_x1000,
+                snap_count,
+                ai_mse_x1000000,
+                flags,
+                control_mode,
+                on_time_min,
+                off_time_min,
+                rul_percent_x100,
+            ) = struct.unpack(SNAP_COMPACT_V3_FMT, b[:SNAP_COMPACT_V3_SIZE])
+
+            rul_percent = float(rul_percent_x100) / 100.0
+            layout = "snap_47b_compact_v3_ttl_scaled_fft_ai_schedule_rul"
+            tail_valid = True
+
+        elif len(b) >= SNAP_COMPACT_V2_SIZE:
             (
                 t_val,
                 ttl,
@@ -430,12 +517,16 @@ def unpack_snap_bin(b: bytes):
         ai_pred = (int(flags) >> 2) & 0x01
         ok = (int(flags) >> 7) & 0x01
     else:
-        # Legacy compact firmware flag mapping.
         fft_valid = 1 if int(f1_x100) > 0 else 0
         ai_valid = int(flags) & 0x01
         ai_pred = (int(flags) >> 1) & 0x01
         ok = (int(flags) >> 2) & 0x01
+
     err_code = 0 if ok else 1
+
+    if rul_percent is not None and not (0.0 <= rul_percent <= 100.0):
+        rul_percent = None
+        rul_percent_x100 = None
 
     scaled = {
         "t": int(t_val),
@@ -453,12 +544,17 @@ def unpack_snap_bin(b: bytes):
         "ai_valid": int(ai_valid),
         "ai_mse": float(ai_mse_x1000000) / SNAP_AI_MSE_SCALE,
         "ai_pred": int(ai_pred),
+        "rul_percent": rul_percent,
+        "rul_present": len(b) >= SNAP_COMPACT_V3_SIZE,
         "flags": int(flags),
         "control_mode": None if control_mode is None else int(control_mode),
         "on_time_min": None if on_time_min is None or int(on_time_min) == 0xFFFF else int(on_time_min),
         "off_time_min": None if off_time_min is None or int(off_time_min) == 0xFFFF else int(off_time_min),
         "ai_raw": {
             "mse_x1000000": int(ai_mse_x1000000),
+        },
+        "rul_raw": {
+            "percent_x100": None if rul_percent_x100 is None else int(rul_percent_x100),
         },
         "tail_valid": tail_valid,
         "fft_pairs": [
@@ -473,7 +569,6 @@ def unpack_snap_bin(b: bytes):
 
     if _is_plausible_snap(scaled):
         return scaled
-
     return None
 
 def unpack_status_bin(b: bytes):
@@ -779,27 +874,39 @@ def _unpack_light_state_event_candidate(b: bytes, layout: str, offsets: dict):
     return result
 
 
-def _light_event_measurements_usable(event: dict) -> bool:
+def _light_event_temperature_usable(event: dict) -> bool:
     valid_flags = int(event.get("valid_flags", 0) or 0)
     valid_temp = bool(valid_flags & 0x04)
+
+    if not valid_temp:
+        return True
+
+    temp = _bounded_number(event.get("temp"), "temperature")
+    return temp is not None and abs(float(temp)) >= NODE_ZERO_EPS
+
+
+def _light_event_fft_usable(event: dict) -> bool:
+    valid_flags = int(event.get("valid_flags", 0) or 0)
     valid_fft = bool(valid_flags & 0x08)
 
-    if valid_temp:
-        temp = _bounded_number(event.get("temp"), "temperature")
-        if temp is None or abs(float(temp)) < NODE_ZERO_EPS:
-            return False
+    if not valid_fft:
+        return True
 
-    if valid_fft:
-        try:
-            fft_count_raw = int(event.get("fft_count_raw", event.get("fft_count", 0)) or 0)
-        except (TypeError, ValueError):
-            return False
-        if fft_count_raw <= 0:
-            return False
-        if _fft_missing_value(event.get("fft_pairs")):
-            return False
+    try:
+        fft_count_raw = int(event.get("fft_count_raw", event.get("fft_count", 0)) or 0)
+    except (TypeError, ValueError):
+        return False
+    if fft_count_raw <= 0:
+        return False
+    return not _fft_missing_value(event.get("fft_pairs"))
 
-    return True
+
+def _light_event_measurements_usable(event: dict) -> bool:
+    """Return whether every measurement marked valid by the node parses correctly."""
+    return (
+        _light_event_temperature_usable(event)
+        and _light_event_fft_usable(event)
+    )
 
 
 def unpack_light_state_event_bin(b: bytes):
@@ -1088,6 +1195,18 @@ def _sanitize_ai_result(*, ai_valid=None, ai_mse=None, ai_pred=None):
     }
 
 
+def _sanitize_rul_percent(value):
+    if value is None:
+        return None
+    try:
+        rul = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(rul) or not (0.0 <= rul <= 100.0):
+        return None
+    return round(rul, 2)
+
+
 def _fallback_snap_head_usable(snap: dict) -> bool:
     """
     SNAP head에 들어있는 voltage/current/temperature/light_on 사용 가능 여부만 판단한다.
@@ -1164,8 +1283,13 @@ class CmdRouter:
         self.pending_multi = {}
         self.comm_health = {}
         self._last_wisun_status = {}
+        # connection watchdog 전용 상태. 센싱 SNAP과 분리하여 상태 이벤트만 발행한다.
+        self._connection_watchdog_state = {}
+        self.connection_watchdog_check_period_sec = 5.0
         self._last_good_measurements = {}
         self.uplink_dedupe_window_sec = 2.0
+        # Report retries can arrive after the short UART duplicate window.
+        self.report_dedupe_window_sec = 300.0
         self._recent_uplink = {}
         self._recent_uplink_lock = threading.Lock()
         self._comm_lock = threading.Lock()
@@ -1191,6 +1315,12 @@ class CmdRouter:
             daemon=True
         )
         self._pending_watchdog.start()
+
+        self._connection_watchdog = threading.Thread(
+            target=self._connection_watchdog_loop,
+            daemon=True,
+        )
+        self._connection_watchdog.start()
         
     
         self._env_thread = threading.Thread(
@@ -1372,10 +1502,12 @@ class CmdRouter:
 
             _verbose_print(f"[GW_ENV] tick gid={self.gwid} period={wait_sec}s")
             latest = read_env_latest()
-            env_values = _extract_env_values(latest)
+            now_ts = int(time.time())
+            env_values, env_sensor_ok, env_sensor_reason, env_sensor_age_sec = (
+                _prepare_env_values(latest, now_ts)
+            )
             gps_latest = read_gw_info_latest()
             gps_values = _extract_gps_values(gps_latest)
-            now_ts = int(time.time())
             tx_ts = (
                 env_values.get("ts")
                 if isinstance(env_values, dict) and env_values.get("ts") is not None
@@ -1397,6 +1529,9 @@ class CmdRouter:
                     "tx_ts": tx_ts,
                     "interval": float(getattr(self, "snap_batch_period_sec", 60.0) or 60.0),
                     "sensor_interval": float(getattr(self, "gw_env_period_sec", 60.0) or 60.0),
+                    "sensor_status": "normal" if env_sensor_ok else "offline",
+                    "sensor_status_reason": env_sensor_reason,
+                    "sensor_age_sec": env_sensor_age_sec,
                     "gnss_lock": bool(gnss_status.get("lock")),
                     "gnss_lock_status": gnss_status.get("status"),
                     "gnss_lock_text": gnss_status.get("status_text"),
@@ -1649,15 +1784,21 @@ class CmdRouter:
 
             def _gw_get_env_info(raw_msg_id=None):
                 latest = read_env_latest()
-                env_values = _extract_env_values(latest)
+                now_ts = int(time.time())
+                env_values, env_sensor_ok, env_sensor_reason, env_sensor_age_sec = (
+                    _prepare_env_values(latest, now_ts)
+                )
 
                 resp = {
                     "cmd": "get_env_info_ack",
                     "gid": self.gwid,          # gw 응답이면 gid 넣는 게 보통 더 좋음
                     "values": env_values,
-                    "ok": bool(env_values),
+                    "ok": env_sensor_ok,
+                    "sensor_status": "normal" if env_sensor_ok else "offline",
+                    "sensor_status_reason": env_sensor_reason,
+                    "sensor_age_sec": env_sensor_age_sec,
                     "msg_id": raw_msg_id,
-                    "ts": int(time.time()),
+                    "ts": now_ts,
                 }
                 _publish_gw(resp)
                 _verbose_print("[CMD] get_env_info_ack:", resp)
@@ -2102,13 +2243,35 @@ class CmdRouter:
                 tx_msg_id16 = int(msg_id_int) & 0xFFFF
 
                 try:
-                    self._pending_push(mid=mid, api_cmd="set_power_ctrl", srv_msg_id=raw_msg_id,
-                                    want="ack", tx_msg_id=tx_msg_id16, ttl_sec=3.0)
-                    data = payload.get("data") or {}
-                    status = int(data.get("status", 0))  # 기본 0
-                    status = 1 if status else 0          # 0/1로 정규화
+                    status = 1 if st else 0
 
-                    extra = bytes([status])          
+                    extra = bytes([status])
+                    expected_ack_type = LIGHT_ON_ACK_T if status else LIGHT_OFF_ACK_T
+                    rec = self._store_latest_by_mid(mid)
+                    expected_uid = (
+                        str(rec.get("uid") or "").lower()
+                        if isinstance(rec, dict) else ""
+                    )
+                    retry_meta = {
+                        "power_ctrl_retry": True,
+                        "attempt": 1,
+                        "max_attempts": POWER_CTRL_MAX_ATTEMPTS,
+                        "tx_cmd_code": cmd_code,
+                        "tx_flags": flags2,
+                        "tx_extra_hex": extra.hex(),
+                        "expected_ack_type": expected_ack_type,
+                        "expected_status": status,
+                        "expected_uid": expected_uid,
+                    }
+                    self._pending_push(
+                        mid=mid,
+                        api_cmd="set_power_ctrl",
+                        srv_msg_id=raw_msg_id,
+                        want="ack",
+                        tx_msg_id=tx_msg_id16,
+                        ttl_sec=POWER_CTRL_ACK_TIMEOUT_SEC,
+                        meta=retry_meta,
+                    )
                     self.wisun.send_cmd_bytes(mid, cmd_code, msg_id=tx_msg_id16, flags=flags2, extra=extra)
 
                     self.log.info("DL cmd=set_power_ctrl mid=%d code=0x%02X flags=0x%02X status=%d msg_id=%s tx_msg_id=%d",
@@ -2119,8 +2282,10 @@ class CmdRouter:
                         "gid": self.gwid,
                         "mid": mid,
                         "msg_id": raw_msg_id,
-                        "result": "success",
+                        "result": "pending",
                         "queued": True,
+                        "attempt": 1,
+                        "max_attempts": POWER_CTRL_MAX_ATTEMPTS,
                         "data": {"status": status},
                     })
                     _verbose_print(f"[CMD] set_power_ctrl → mid={mid} code=0x{cmd_code:02X} flags=0x{flags2:02X}")
@@ -2451,10 +2616,13 @@ class CmdRouter:
                         want="ack",
                         tx_msg_id=tx_msg_id16,
                         ttl_sec=3.0,
-                        meta=tx_meta,
+                        meta=self._setting_pending_meta(mid, tx_meta),
                     )
 
                     self.wisun.send_cmd_bytes(mid, CMD_SET_SETTING, msg_id=tx_msg_id16, flags=0x00, extra=extra)
+                    self._set_node_watchdog_interval(
+                        mid, tx_meta.get("tx_interval"), reason="set_setting_tx"
+                    )
                     print(f"[CMD TX SET_SETTING] mid={mid} msg_id={tx_msg_id16} meta={tx_meta}", flush=True)
 
                     _publish_node(api_cmd, {
@@ -2462,7 +2630,8 @@ class CmdRouter:
                         "gid": self.gwid,
                         "mid": mid,
                         "msg_id": tx_msg_id16,
-                        "result": "success",
+                        "result": "pending",
+                        "applied": False,
                         "queued": True,
                         **tx_meta,
                     })
@@ -2515,19 +2684,37 @@ class CmdRouter:
 
             # 서버 payload 호환:
             # 1) interval
-            # 2) snap_period_min
-            # 3) 기존 저장 interval
-            # 4) 최종 기본값 60분
+            # 2) snap_period_min (legacy API key; value is handled as seconds)
+            # 3) outer payload interval
+            # 4) 최종 기본값 60초
             snap_period_raw = (
                 d.get("interval")
                 if d.get("interval") is not None
+                else d.get("snap_period_sec")
+                if d.get("snap_period_sec") is not None
+                else d.get("snap_period_min")
+                if d.get("snap_period_min") is not None
                 else payload.get("interval")
                 if payload.get("interval") is not None
-                else 60
+                else payload.get("snap_period_sec")
+                if payload.get("snap_period_sec") is not None
+                else SET_SETTING_INTERVAL_DEFAULT_SEC
             )
 
-            snap_period_min = int(snap_period_raw or 60)
-            snap_period_min = max(1, min(120, snap_period_min))
+            snap_period_sec = int(snap_period_raw or SET_SETTING_INTERVAL_DEFAULT_SEC)
+            snap_period_sec = max(1, min(SET_SETTING_INTERVAL_MAX_SEC, snap_period_sec))
+            ai_period_raw = d.get("ai_period_sec")
+            if ai_period_raw is None:
+                ai_period_raw = d.get("ai_interval", d.get("ai_period"))
+            if ai_period_raw is None:
+                ai_period_raw = payload.get(
+                    "ai_period_sec",
+                    payload.get("ai_interval", payload.get("ai_period", snap_period_sec)),
+                )
+            ai_period_sec = max(
+                1,
+                min(SET_SETTING_INTERVAL_MAX_SEC, int(ai_period_raw or snap_period_sec)),
+            )
 
             forced_time = max(0, min(0xFFFF, forced_time))
 
@@ -2545,12 +2732,16 @@ class CmdRouter:
                 saving_end_h & 0xFF,
                 saving_end_m & 0xFF,
                 (1 if snap_enable else 0) & 0xFF,
-                snap_period_min & 0xFF,
+                0x00,
                 on_h & 0xFF,
                 on_m & 0xFF,
                 off_h & 0xFF,
                 off_m & 0xFF,
-            ])
+                snap_period_sec & 0xFF,
+                (snap_period_sec >> 8) & 0xFF,
+            ]) + bytes(10) + struct.pack("<H", ai_period_sec)
+            if len(extra) != SET_SETTING_PAYLOAD_SIZE:
+                raise ValueError(f"invalid_setting_payload_size:{len(extra)}")
             tx_msg_id16 = int(msg_id_int) & 0xFFFF
             tx_meta = {
                 "tx_on_off_mode": on_off_mode,
@@ -2567,19 +2758,11 @@ class CmdRouter:
                 "tx_saving_start_time": f"{saving_start_h:02d}:{saving_start_m:02d}",
                 "tx_saving_end_time": f"{saving_end_h:02d}:{saving_end_m:02d}",
                 "tx_snap_enable": 1 if snap_enable else 0,
-                "tx_interval": snap_period_min,
+                "tx_interval": snap_period_sec,
+                "tx_ai_interval": ai_period_sec,
                 "tx_extra_hex": extra.hex(),
             }
             try:
-                if self.store is not None:
-                    rec = self._store_latest_by_mid(mid)
-                    uid_for_store = rec.get("uid") if isinstance(rec, dict) else None
-                    self.store.upsert(
-                        uid=uid_for_store,
-                        mid=mid,
-                        interval=snap_period_min,
-                    )
-
                 self._pending_push(
                     mid=mid,
                     api_cmd=api_cmd,
@@ -2587,11 +2770,14 @@ class CmdRouter:
                     want="ack",
                     tx_msg_id=tx_msg_id16,
                     ttl_sec=3.0,
-                    meta=tx_meta,
+                    meta=self._setting_pending_meta(mid, tx_meta),
                 )
 
                 
                 self.wisun.send_cmd_bytes(mid, CMD_SET_SETTING, msg_id=tx_msg_id16, flags=0x00, extra=extra)
+                self._set_node_watchdog_interval(
+                    mid, tx_meta.get("tx_interval"), reason="set_setting_tx"
+                )
                 print(f"[CMD TX SET_SETTING] mid={mid} msg_id={tx_msg_id16} meta={tx_meta}", flush=True)
 
                 
@@ -2600,7 +2786,8 @@ class CmdRouter:
                     "gid": self.gwid,
                     "mid": mid,
                     "msg_id": tx_msg_id16,
-                    "result": "success",
+                    "result": "pending",
+                    "applied": False,
                     "queued": True,
                     **tx_meta,
                 })
@@ -2657,15 +2844,34 @@ class CmdRouter:
                         srv_msg_id=raw_msg_id,
                         want="ack",
                         tx_msg_id=tx_msg_id16,
-                        ttl_sec=5.0,
-                        meta=per_node_meta,
+                        ttl_sec=75.0,
+                        meta=self._setting_pending_meta(mid, per_node_meta),
                     )
-                    self.wisun.send_cmd_bytes(mid, CMD_SET_SETTING, msg_id=tx_msg_id16, flags=0x00, extra=extra)
-                    print(
-                        f"[CMD TX BATCH SET_SETTING] batch_id={batch_id} "
-                        f"mid={mid} msg_id={tx_msg_id16} extra={extra.hex()}",
-                        flush=True,
+
+                    for attempt in (1, 2):
+                        self.wisun.send_cmd_bytes(
+                            mid,
+                            CMD_SET_SETTING,
+                            msg_id=tx_msg_id16,
+                            flags=0x00,
+                            extra=extra,
+                        )
+                        print(
+                            f"[CMD TX BATCH SET_SETTING] batch_id={batch_id} "
+                            f"mid={mid} msg_id={tx_msg_id16} attempt={attempt}/2 "
+                            f"extra={extra.hex()}",
+                            flush=True,
+                        )
+                        if attempt == 1:
+                            time.sleep(0.25)
+
+                    self._set_node_watchdog_interval(
+                        mid, per_node_meta.get("tx_interval"), reason="batch_set_setting_tx"
                     )
+
+                    if idx + 1 < len(expected_mids):
+                        time.sleep(0.40)
+
                 except Exception as e:
                     send_failures.append((mid, tx_msg_id16, str(e)))
                     self._batch_record_node_result(
@@ -2914,12 +3120,10 @@ class CmdRouter:
             if text in mode_map:
                 return mode_map[text]
         parsed = int(value)
-        # Server/API mode is 1-based, firmware mode is 0-based:
-        # 0=sunrise/sunset, 1=civil twilight, 2=fixed time, 3=manual/forced.
-        if 1 <= parsed <= 4:
-            return parsed - 1
-        if parsed == 0:
-            return 0
+        # 관제/API와 펌웨어 모두 동일한 0-based mode를 사용한다.
+        # 0=일출·일몰, 1=시민박명, 2=고정시간, 3=수동/강제.
+        if 0 <= parsed <= 3:
+            return parsed
         raise ValueError("mode_out_of_range")
 
     def _build_astro_setting_payload(self, d: dict):
@@ -2968,19 +3172,52 @@ class CmdRouter:
         on_h, on_m = divmod(on_min, 60)
         off_h, off_m = divmod(off_min, 60)
         snap_enable = 1 if int(d.get("snap_enable", 1) or 1) else 0
-        interval_min = max(1, min(120, int(d.get("interval", d.get("snap_period_min", 60)) or 60)))
+        interval_sec = max(
+            1,
+            min(
+                SET_SETTING_INTERVAL_MAX_SEC,
+                int(
+                    d.get(
+                        "interval",
+                        d.get(
+                            "snap_period_sec",
+                            d.get("snap_period_min", SET_SETTING_INTERVAL_DEFAULT_SEC),
+                        ),
+                    )
+                    or SET_SETTING_INTERVAL_DEFAULT_SEC
+                ),
+            ),
+        )
+        ai_period_sec = max(
+            1,
+            min(
+                SET_SETTING_INTERVAL_MAX_SEC,
+                int(
+                    d.get(
+                        "ai_period_sec",
+                        d.get("ai_interval", d.get("ai_period", interval_sec)),
+                    )
+                    or interval_sec
+                ),
+            ),
+        )
 
-        # Unified SET_SETTING(0x31), 30-byte payload.
+        # Unified SET_SETTING(0x31), 32-byte payload.
+        # data[18:20] carries the transmission period as little-endian u16;
+        # data[30:32] carries the AI period as little-endian u16.
+        # data[13] is reserved for firmware versions that no longer accept u8.
         # Bytes 20..29 enable and carry the selected coordinate.
         extra = bytes([
             mode, on_corr_mode, on_corr_time, off_corr_mode, off_corr_time,
             forced_time & 0xFF, (forced_time >> 8) & 0xFF,
             saving_mode, saving_start_h, saving_start_m,
-            saving_end_h, saving_end_m, snap_enable, interval_min,
+            saving_end_h, saving_end_m, snap_enable, 0x00,
             on_h, on_m, off_h, off_m,
-            interval_min & 0xFF, (interval_min >> 8) & 0xFF,
+            interval_sec & 0xFF, (interval_sec >> 8) & 0xFF,
             1, apply_coord_type,
-        ]) + struct.pack(">ii", selected_lat_i32, selected_lon_i32)
+        ]) + struct.pack(">ii", selected_lat_i32, selected_lon_i32) + struct.pack("<H", ai_period_sec)
+        if len(extra) != SET_SETTING_PAYLOAD_SIZE:
+            raise ValueError(f"invalid_setting_payload_size:{len(extra)}")
         meta = {
             "tx_cmd_code": CMD_SET_SETTING,
             "tx_on_off_mode": mode,
@@ -2996,12 +3233,19 @@ class CmdRouter:
             "tx_install_lat": install_lat_i32,
             "tx_install_lon": install_lon_i32,
             "tx_extra_hex": extra.hex(),
+            "tx_interval": interval_sec,
+            "tx_ai_interval": ai_period_sec,
         }
         public_data = {
             "mode": mode,
             "apply_coord_type": apply_coord_type,
-            "on_time": on_min,
-            "off_time": off_min,
+            # 아래 값은 관제 요청값이다. 실제 적용값은 nodes[].ACK 데이터로 확인한다.
+            "requested_on_time": on_min,
+            "requested_off_time": off_min,
+            "requested_on_time_text": f"{on_min // 60:02d}:{on_min % 60:02d}",
+            "requested_off_time_text": f"{off_min // 60:02d}:{off_min % 60:02d}",
+            "on_time": None,
+            "off_time": None,
             "standard_lat": float(d["standard_lat"]) if d.get("standard_lat") is not None else None,
             "standard_lon": float(d["standard_lon"]) if d.get("standard_lon") is not None else None,
             "install_lat": float(d["install_lat"]) if d.get("install_lat") is not None else None,
@@ -3290,7 +3534,15 @@ class CmdRouter:
             return None
         return msg
 
-    def _should_drop_duplicate_uplink(self, kind: str, mid: int, fingerprint) -> bool:
+    def _should_drop_duplicate_uplink(
+        self,
+        kind: str,
+        mid: int,
+        fingerprint,
+        *,
+        window_sec: float | None = None,
+        record: bool = True,
+    ) -> bool:
         try:
             mid_int = int(mid or 0)
         except (TypeError, ValueError):
@@ -3299,7 +3551,11 @@ class CmdRouter:
             return False
 
         now = time.monotonic()
-        window = float(getattr(self, "uplink_dedupe_window_sec", 2.0) or 2.0)
+        window = float(
+            window_sec
+            if window_sec is not None
+            else (getattr(self, "uplink_dedupe_window_sec", 2.0) or 2.0)
+        )
         if window <= 0:
             return False
 
@@ -3308,6 +3564,9 @@ class CmdRouter:
             prev = self._recent_uplink.get(key)
             if prev is not None and (now - prev) <= window:
                 return True
+
+            if not record:
+                return False
 
             self._recent_uplink[key] = now
             expire_before = now - max(window * 4.0, 10.0)
@@ -3319,6 +3578,43 @@ class CmdRouter:
                 for stale_key in stale_keys:
                     self._recent_uplink.pop(stale_key, None)
         return False
+
+    def _send_report_ack(self, *, mid: int, report_cmd: int, msg_id: int, ok: bool) -> bool:
+        """ACK a node-originated report with cmd=0x16 and body={report_cmd, ok}."""
+        try:
+            self.wisun.send_cmd_bytes(
+                int(mid),
+                CMD_REPORT_ACK,
+                msg_id=int(msg_id) & 0xFFFF,
+                flags=0x00,
+                extra=bytes([int(report_cmd) & 0xFF, 1 if ok else 0]),
+            )
+            print(
+                f"[GW REPORT ACK] mid={int(mid)} report_cmd=0x{int(report_cmd) & 0xFF:02X} "
+                f"msg_id={int(msg_id) & 0xFFFF} ok={1 if ok else 0}",
+                flush=True,
+            )
+            return True
+        except Exception as e:
+            self.log.warning(
+                "report ack send failed mid=%s report_cmd=0x%02X msg_id=%s ok=%s err=%r",
+                mid,
+                int(report_cmd) & 0xFF,
+                int(msg_id) & 0xFFFF,
+                1 if ok else 0,
+                e,
+            )
+            return False
+
+    @staticmethod
+    def _mqtt_publish_queued(info) -> bool:
+        """paho rc=0 means the QoS publish was accepted into its outgoing queue."""
+        if info is None:
+            return False
+        try:
+            return int(info.rc) == 0
+        except (AttributeError, TypeError, ValueError):
+            return True
     
     def _should_drop_duplicate_global_uplink(self, kind: str, fingerprint) -> bool:
         if fingerprint is None:
@@ -3519,7 +3815,9 @@ class CmdRouter:
         ai_valid=None,
         ai_mse=None,
         ai_pred=None,
+        rul_percent=None,
         source: str | None = None,
+        rul_present: bool = False,
         update_last_snap_ts: bool = True,
     ):
         if self.store is None:
@@ -3546,6 +3844,7 @@ class CmdRouter:
             ai_mse=ai_mse,
             ai_pred=ai_pred,
         )
+        clean_rul_percent = _sanitize_rul_percent(rul_percent)
 
         # raw temperature가 들어왔는데 sanitize 후 None이면,
         # 예: 노드가 -999.0을 보낸 상황.
@@ -3648,6 +3947,10 @@ class CmdRouter:
                 ai_valid=clean_ai["ai_valid"],
                 ai_mse=clean_ai["ai_mse"],
                 ai_pred=clean_ai["ai_pred"],
+                rul_percent=clean_rul_percent,
+                # An invalid RUL in a SNAP clears the current value. Messages
+                # without a RUL field must leave the stored value unchanged.
+                clear_rul_percent=(rul_present or rul_percent is not None) and clean_rul_percent is None,
                 ts=ts,
                 pending_send=True,
                 last_snap_ts=ts if has_measure and update_last_snap_ts else None,
@@ -3747,6 +4050,59 @@ class CmdRouter:
             "meta": dict(meta or {}),
         })
 
+    def _set_node_watchdog_interval(self, mid: int, interval_sec, *, reason: str) -> bool:
+        """Persist expected SNAP interval without making the node look newly seen."""
+        if self.store is None or interval_sec is None:
+            return False
+        try:
+            mid_int = int(mid or 0)
+            interval_int = max(1, min(SET_SETTING_INTERVAL_MAX_SEC, int(interval_sec)))
+        except (TypeError, ValueError):
+            return False
+        if mid_int <= 0:
+            return False
+
+        try:
+            if hasattr(self.store, "update_interval_by_mid"):
+                updated = self.store.update_interval_by_mid(mid_int, interval_int)
+                ok = bool(updated)
+            else:
+                rec = self._store_latest_by_mid(mid_int)
+                uid = str(rec.get("uid") or "") if isinstance(rec, dict) else ""
+                if not uid:
+                    return False
+                ok = bool(self.store.upsert(uid=uid, mid=mid_int, interval=interval_int))
+
+            if ok:
+                self.log.info(
+                    "watchdog interval update mid=%d interval=%d reason=%s",
+                    mid_int, interval_int, reason,
+                )
+            return ok
+        except Exception as e:
+            self.log.warning(
+                "watchdog interval update failed mid=%s interval=%s reason=%s err=%r",
+                mid, interval_sec, reason, e,
+            )
+            return False
+
+    def _setting_pending_meta(self, mid: int, meta: dict | None = None) -> dict:
+        result = dict(meta or {})
+        rec = self._store_latest_by_mid(mid)
+        result["requires_setting_ack"] = True
+        result["expected_uid"] = (
+            str(rec.get("uid") or "").lower() if isinstance(rec, dict) else ""
+        )
+        if isinstance(rec, dict):
+            try:
+                previous_interval = int(rec.get("interval") or 0)
+            except Exception:
+                previous_interval = 0
+            result["previous_interval"] = previous_interval if previous_interval > 0 else None
+        else:
+            result["previous_interval"] = None
+        return result
+
     def _expire_pending_for_mid(self, mid: int, now: float | None = None):
         q = self.pending.get(mid)
         if not q:
@@ -3754,8 +4110,15 @@ class CmdRouter:
 
         now_ts = self._now() if now is None else now
         expired_items = []
-        while q and (now_ts - q[0]["t"]) > q[0]["ttl"]:
-            expired_items.append(q.popleft())
+        # Pending commands for one MID can have different TTLs. Inspect every
+        # item so a short power-control timeout is not blocked by an older,
+        # long-lived setting request at the head of the deque.
+        for _ in range(len(q)):
+            item = q.popleft()
+            if (now_ts - item["t"]) > item["ttl"]:
+                expired_items.append(item)
+            else:
+                q.append(item)
         return expired_items
 
     def _handle_expired_pending(self, mid: int, expired_items):
@@ -3763,6 +4126,66 @@ class CmdRouter:
             if expired.get("want") != "ack":
                 continue
             meta = expired.get("meta") or {}
+            if meta.get("power_ctrl_retry"):
+                attempt = int(meta.get("attempt", 1) or 1)
+                max_attempts = int(
+                    meta.get("max_attempts", POWER_CTRL_MAX_ATTEMPTS)
+                    or POWER_CTRL_MAX_ATTEMPTS
+                )
+                if attempt < max_attempts:
+                    next_attempt = attempt + 1
+                    retry_meta = dict(meta)
+                    retry_meta["attempt"] = next_attempt
+                    try:
+                        self.wisun.send_cmd_bytes(
+                            int(mid),
+                            int(meta["tx_cmd_code"]),
+                            msg_id=int(expired.get("tx_msg_id") or 0) & 0xFFFF,
+                            flags=int(meta.get("tx_flags", 0)) & 0xFF,
+                            extra=bytes.fromhex(str(meta.get("tx_extra_hex") or "")),
+                        )
+                        self.log.warning(
+                            "DL retry cmd=set_power_ctrl mid=%d msg_id=%d attempt=%d/%d",
+                            int(mid), int(expired.get("tx_msg_id") or 0),
+                            next_attempt, max_attempts,
+                        )
+                        print(
+                            f"[CMD RETRY set_power_ctrl] mid={int(mid)} "
+                            f"msg_id={int(expired.get('tx_msg_id') or 0)} "
+                            f"attempt={next_attempt}/{max_attempts}",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        self.log.warning(
+                            "DL retry send error cmd=set_power_ctrl mid=%d msg_id=%s "
+                            "attempt=%d/%d err=%r",
+                            int(mid), expired.get("tx_msg_id"),
+                            next_attempt, max_attempts, e,
+                        )
+
+                    expired["t"] = self._now()
+                    expired["ttl"] = POWER_CTRL_ACK_TIMEOUT_SEC
+                    expired["meta"] = retry_meta
+                    self.pending[int(mid)].append(expired)
+                    continue
+
+                self._ack_fail(
+                    expired["api"],
+                    expired.get("srv_msg_id"),
+                    mid,
+                    "ack_timeout_after_retries",
+                )
+                self._comm_mark_error(
+                    mid,
+                    "response_timeout",
+                    detail=(
+                        f"api={expired.get('api')} attempts={attempt}/{max_attempts}"
+                    ),
+                    count_field="timeout_count",
+                    mark_pending=True,
+                )
+                continue
+
             batch_id = meta.get("batch_id")
             if batch_id:
                 self._batch_record_node_result(
@@ -3771,7 +4194,7 @@ class CmdRouter:
                     result="timeout",
                     node_msg_id=expired.get("tx_msg_id"),
                     ts=int(time.time()),
-                    reason="timeout",
+                    reason="set_setting_ack_timeout",
                 )
                 self._comm_mark_error(
                     mid,
@@ -3790,6 +4213,65 @@ class CmdRouter:
                 mark_pending=True,
             )
 
+    def _pending_pop_setting_ack(self, mid: int, tx_msg_id: int, uid: str):
+        q = self.pending.get(int(mid))
+        if not q:
+            return None
+        self._handle_expired_pending(mid, self._expire_pending_for_mid(mid))
+        uid_norm = str(uid or "").lower()
+        for item in list(q):
+            meta = item.get("meta") or {}
+            if not meta.get("requires_setting_ack"):
+                continue
+            if int(item.get("tx_msg_id", -1)) != (int(tx_msg_id) & 0xFFFF):
+                continue
+            expected_uid = str(meta.get("expected_uid") or "").lower()
+            if not expected_uid or expected_uid != uid_norm:
+                continue
+            try:
+                q.remove(item)
+            except ValueError:
+                return None
+            return item
+        return None
+
+    def _pending_pop_power_ack(
+        self,
+        mid: int,
+        tx_msg_id: int,
+        ack_type: int,
+        light_on: int,
+        uid: str,
+        ok: int = 1,
+    ):
+        q = self.pending.get(int(mid))
+        if not q:
+            return None
+        self._handle_expired_pending(mid, self._expire_pending_for_mid(mid))
+        uid_norm = str(uid or "").lower()
+        for item in list(q):
+            meta = item.get("meta") or {}
+            if not meta.get("power_ctrl_retry"):
+                continue
+            if int(item.get("tx_msg_id", -1)) != (int(tx_msg_id) & 0xFFFF):
+                continue
+            if int(meta.get("expected_ack_type", -1)) != int(ack_type):
+                continue
+            # A successful ACK must report the requested final state. A
+            # negative ACK is still authoritative and ends retries even when
+            # it reports the unchanged physical state.
+            if int(ok) and int(meta.get("expected_status", -1)) != int(light_on):
+                continue
+            expected_uid = str(meta.get("expected_uid") or "").lower()
+            if expected_uid and expected_uid != uid_norm:
+                continue
+            try:
+                q.remove(item)
+            except ValueError:
+                return None
+            return item
+        return None
+
     def _pending_pop_ack(self, mid: int, tx_msg_id: int | None):
         q = self.pending.get(mid)
         if not q:
@@ -3806,7 +4288,11 @@ class CmdRouter:
         if tx_msg_id is None:
             for _ in range(len(q)):
                 item = q[0]
-                if item.get("want") == "ack":
+                if (
+                    item.get("want") == "ack"
+                    and not (item.get("meta") or {}).get("requires_setting_ack")
+                    and not (item.get("meta") or {}).get("power_ctrl_retry")
+                ):
                     return q.popleft()
                 q.rotate(-1)
             return None
@@ -3814,7 +4300,12 @@ class CmdRouter:
         # tx_msg_id로 정확히 매칭
         for _ in range(len(q)):
             item = q[0]
-            if item.get("want") == "ack" and item.get("tx_msg_id") == tx_msg_id:
+            if (
+                item.get("want") == "ack"
+                and item.get("tx_msg_id") == tx_msg_id
+                and not (item.get("meta") or {}).get("requires_setting_ack")
+                and not (item.get("meta") or {}).get("power_ctrl_retry")
+            ):
                 return q.popleft()
             q.rotate(-1)
 
@@ -3832,6 +4323,129 @@ class CmdRouter:
                         self._handle_expired_pending(mid, expired_items)
             except Exception as e:
                 self.log.warning("pending watchdog error: %r", e)
+
+    def _publish_connection_status_event(
+        self,
+        *,
+        mid: int,
+        rec: dict,
+        now: int,
+        connected: bool,
+        reason: str,
+        offline_threshold_sec: int,
+        window_source: str,
+        base_interval_sec: int | None,
+    ) -> None:
+        """
+        Wi-SUN 연결 상태 이벤트를 센싱 SNAP과 다른 토픽으로 발행한다.
+
+        중요:
+        - node/{gwid}/snap 에는 절대 발행하지 않는다.
+        - 측정값(data)을 포함하지 않는다.
+        - event_only/measurement_valid 필드로 관제의 오해석을 방지한다.
+        """
+        if self.mqtt is None:
+            return
+
+        last_ts = int(rec.get("last_ts") or rec.get("ts") or 0)
+        last_snap_ts = int(rec.get("last_snap_ts") or 0)
+        wisun_status = WISUN_STATUS_OK if connected else WISUN_STATUS_OFFLINE
+        node_obj = {
+            "mid": int(mid),
+            "uid": rec.get("uid"),
+            "mac": rec.get("mac"),
+            "last_ts": last_ts,
+            "last_snap_ts": last_snap_ts,
+            "last_age_sec": None if last_ts <= 0 else max(0, int(now) - last_ts),
+            "snap_age_sec": None if last_snap_ts <= 0 else max(0, int(now) - last_snap_ts),
+            "wisun_status": wisun_status,
+            "wisun_status_text": WISUN_STATUS_TEXT[wisun_status],
+            "status": "connected" if connected else "disconnected",
+            "reason": reason,
+            "offline_threshold_sec": int(offline_threshold_sec),
+            "event_only": True,
+            "measurement_valid": False,
+            "comm_health": self._comm_health_payload(mid, now=now, rec=rec),
+            "watchdog": {
+                "window_source": window_source,
+                "base_interval_sec": base_interval_sec,
+                "check_period_sec": float(self.connection_watchdog_check_period_sec),
+            },
+        }
+        payload = {
+            "cmd": "node_connection_status",
+            "gid": self.gwid,
+            "ts": int(now),
+            "source": "connection_watchdog",
+            "event_only": True,
+            "measurement_valid": False,
+            "nodes": [node_obj],
+        }
+        topic = f"node/{self.gwid}/node_connection_status"
+        self.mqtt.publish_json(topic, payload)
+        print(
+            f"[MQTT TX CONNECTION_STATUS] topic={topic} mid={mid} "
+            f"status={node_obj['status']} reason={reason}",
+            flush=True,
+        )
+
+    def _connection_watchdog_loop(self):
+        """NodeStore의 마지막 uplink 시각을 기준으로 연결 끊김/복구 이벤트만 발행한다."""
+        while not self._stop_event.is_set():
+            wait_sec = max(1.0, float(self.connection_watchdog_check_period_sec or 5.0))
+            self._stop_event.wait(wait_sec)
+            if self._stop_event.is_set():
+                break
+            if self.store is None:
+                continue
+
+            try:
+                now = int(time.time())
+                latest_by_mid = {}
+                for rec in self.store.all_nodes():
+                    if not isinstance(rec, dict):
+                        continue
+                    try:
+                        mid = int(rec.get("mid") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if mid <= 0:
+                        continue
+                    old = latest_by_mid.get(mid)
+                    if old is None or int(rec.get("ts") or 0) >= int(old.get("ts") or 0):
+                        latest_by_mid[mid] = rec
+
+                for mid, rec in latest_by_mid.items():
+                    last_ts, online = self._node_inventory_meta(rec, now=now)
+                    threshold, window_source, base_interval = self._snap_online_window_detail(mid=mid)
+                    current = bool(online)
+                    previous = self._connection_watchdog_state.get(mid)
+                    self._connection_watchdog_state[mid] = current
+
+                    # 최초 확인이 정상인 경우에는 불필요한 resumed 이벤트를 만들지 않는다.
+                    if previous is None:
+                        if not current and last_ts > 0:
+                            self._publish_connection_status_event(
+                                mid=mid, rec=rec, now=now, connected=False,
+                                reason="no_recent_uplink",
+                                offline_threshold_sec=threshold,
+                                window_source=window_source,
+                                base_interval_sec=base_interval,
+                            )
+                        continue
+
+                    if previous == current:
+                        continue
+
+                    self._publish_connection_status_event(
+                        mid=mid, rec=rec, now=now, connected=current,
+                        reason="uplink_resumed" if current else "no_recent_uplink",
+                        offline_threshold_sec=threshold,
+                        window_source=window_source,
+                        base_interval_sec=base_interval,
+                    )
+            except Exception as e:
+                self.log.warning("connection watchdog error: %r", e)
 
     def _snap_batch_loop(self):
         while not self._stop_event.is_set():
@@ -3899,7 +4513,7 @@ class CmdRouter:
             last_ts = int(r.get("ts") or 0)
 
             # 예: 마지막 접속 2분 이내면 online 으로 표시
-            online_window_sec = self._snap_online_window_sec()
+            online_window_sec = self._snap_online_window_sec(mid=mid)
             online = (now - last_ts) <= online_window_sec if last_ts > 0 else False
 
             status_info = self._wisun_status_info(mid, now=now, rec=r)
@@ -3929,6 +4543,7 @@ class CmdRouter:
                     "ai_valid":    r.get("ai_valid"),
                     "ai_mse":      r.get("ai_mse"),
                     "ai_pred":     r.get("ai_pred"),
+                    "rul_percent":  r.get("rul_percent"),
                     "measurement_source": "store_current_unverified",
                 },
             })
@@ -4032,6 +4647,7 @@ class CmdRouter:
                     "ai_valid":    r.get("ai_valid"),
                     "ai_mse":      r.get("ai_mse"),
                     "ai_pred":     r.get("ai_pred"),
+                    "rul_percent":  r.get("rul_percent"),
                     "measurement_source": "store_current_unverified",
                 },
             }
@@ -4067,11 +4683,14 @@ class CmdRouter:
         ai_valid=None,
         ai_mse=None,
         ai_pred=None,
+        rul_percent=None,
         measurement_source: str = "uplink_direct",
         extra: dict | None = None,
     ):
-        if not self.direct_uplink_publish or self.mqtt is None:
-            return
+        if not self.direct_uplink_publish:
+            return True
+        if self.mqtt is None:
+            return False
 
         now = int(ts if ts is not None else time.time())
         try:
@@ -4079,7 +4698,7 @@ class CmdRouter:
         except (TypeError, ValueError):
             mid_int = 0
         if mid_int <= 0:
-            return
+            return False
 
         clean = _sanitize_node_measurements(
             voltage=voltage,
@@ -4093,6 +4712,7 @@ class CmdRouter:
             ai_mse=ai_mse,
             ai_pred=ai_pred,
         )
+        clean_rul_percent = _sanitize_rul_percent(rul_percent)
         rec = {
             "mid": mid_int,
             "uid": uid,
@@ -4105,6 +4725,7 @@ class CmdRouter:
             "ai_valid": clean_ai["ai_valid"],
             "ai_mse": clean_ai["ai_mse"],
             "ai_pred": clean_ai["ai_pred"],
+            "rul_percent": clean_rul_percent,
             "ts": now,
             "last_ts": now,
             "last_snap_ts": now,
@@ -4133,6 +4754,7 @@ class CmdRouter:
                 "ai_valid": clean_ai["ai_valid"],
                 "ai_mse": clean_ai["ai_mse"],
                 "ai_pred": clean_ai["ai_pred"],
+                "rul_percent": clean_rul_percent,
                 "measurement_source": measurement_source,
             },
         }
@@ -4147,8 +4769,9 @@ class CmdRouter:
             "nodes": [node_obj],
         }
         topic = f"node/{self.gwid}/snap"
-        self.mqtt.publish_json(topic, payload)
+        publish_info = self.mqtt.publish_json(topic, payload)
         print(f"[MQTT TX DIRECT_SNAP] topic={topic} mid={mid_int} source={measurement_source}", flush=True)
+        return self._mqtt_publish_queued(publish_info)
 
     def _alloc_mid(self) -> int:
         m = self.next_mid
@@ -4190,6 +4813,7 @@ class CmdRouter:
                     return
                 if len(body) >= NODEINFO_SIZE and body[0] == T_NODEINFO_BIN:
                     info = parse_nodeinfo_bin(body)
+
                     self._remember_node_seen(
                         mid=mid,
                         ts=ts,
@@ -4216,7 +4840,7 @@ class CmdRouter:
                     _verbose_print("[MQTT TX GET_NODE_INFO_BIN]", resp)
                     return       
                 # transport header 없는 순수 Ack/Snap인지 체크 
-                if len(payload) >= ACK_BIN_SIZE and payload[0] in (ACK_T, ACK_NODE_CFG_T):
+                if len(payload) >= ACK_BIN_SIZE and payload[0] in ACK_TYPES:
                     body = payload
                     target_mid = ttl = cmd_code = flags = None
                     node_msg_id = None
@@ -4286,7 +4910,7 @@ class CmdRouter:
                         )
 
                     
-                    is_body_ack  = (len(body) >= ACK_BIN_SIZE  and body[0] in (ACK_T, ACK_NODE_CFG_T))
+                    is_body_ack  = (len(body) >= ACK_BIN_SIZE and body[0] in ACK_TYPES)
                     is_body_snap = (len(body) >= SNAP_BIN_SIZE and body[0] == T_SNAP)
                     is_body_light_state = (len(body) >= LIGHT_STATE_EVENT_BIN_SIZE and body[0] == T_LIGHT_STATE_EVENT)
                     is_body_status = (len(body) >= STATUS_BIN_SIZE_V1 and body[0] == STATUS_T)
@@ -4331,24 +4955,39 @@ class CmdRouter:
                         return
 
                     uid_str = event["uid_bytes"].hex()
+                    report_cmd = int(cmd_code) if cmd_code is not None else T_LIGHT_STATE_EVENT
+                    report_msg_id = (
+                        int(node_msg_id) & 0xFFFF
+                        if node_msg_id is not None
+                        else int(event["event_id"]) & 0xFFFF
+                    )
                     valid_flags = int(event["valid_flags"])
                     valid_light = bool(valid_flags & 0x01)
                     valid_vi = bool(valid_flags & 0x02)
                     valid_temp = bool(valid_flags & 0x04)
                     valid_fft = bool(valid_flags & 0x08)
                     valid_rtc = bool(valid_flags & 0x10) and "rtc_year" in event
-                    usable_measurements = _light_event_measurements_usable(event)
-                    if not usable_measurements:
-                        if valid_temp or valid_fft:
-                            print(
-                                f"[GW LIGHT_STATE_EVENT MEASURE_DROP] mid={mid} uid={uid_str} "
-                                f"flags=0x{valid_flags:02X} layout={event.get('parse_layout')} "
-                                f"score={event.get('parse_score')} temp_raw={event.get('temp')} "
-                                f"fft_count_raw={event.get('fft_count_raw', event.get('fft_count'))} "
-                                f"fft_pairs={event.get('fft_pairs')} body_hex={body.hex(' ')}",
-                                flush=True,
-                            )
+                    temperature_parse_ok = _light_event_temperature_usable(event)
+                    fft_parse_ok = _light_event_fft_usable(event)
+                    usable_measurements = temperature_parse_ok and fft_parse_ok
+                    if valid_temp and not temperature_parse_ok:
+                        print(
+                            f"[GW LIGHT_STATE_EVENT TEMP_DROP] mid={mid} uid={uid_str} "
+                            f"flags=0x{valid_flags:02X} layout={event.get('parse_layout')} "
+                            f"score={event.get('parse_score')} temp_raw={event.get('temp')} "
+                            f"body_hex={body.hex(' ')}",
+                            flush=True,
+                        )
                         valid_temp = False
+                    if valid_fft and not fft_parse_ok:
+                        print(
+                            f"[GW LIGHT_STATE_EVENT FFT_DROP] mid={mid} uid={uid_str} "
+                            f"flags=0x{valid_flags:02X} layout={event.get('parse_layout')} "
+                            f"score={event.get('parse_score')} "
+                            f"fft_count_raw={event.get('fft_count_raw', event.get('fft_count'))} "
+                            f"fft_pairs={event.get('fft_pairs')} body_hex={body.hex(' ')}",
+                            flush=True,
+                        )
                         valid_fft = False
 
                     light_on_val = event["light_on"] if valid_light else None
@@ -4359,11 +4998,23 @@ class CmdRouter:
                     rtc_val = event.get("rtc") if valid_rtc else None
                     fallback_from_snap = []
                     fallback_ts = None
-                    if self._should_drop_duplicate_uplink("light_state_event", mid, bytes(body)):
+                    if self._should_drop_duplicate_uplink(
+                        "light_state_event",
+                        mid,
+                        (uid_str, int(event["event_id"])),
+                        window_sec=self.report_dedupe_window_sec,
+                        record=False,
+                    ):
                         _verbose_print(
                             f"[GW DEDUPE] drop duplicate light_state_event mid={mid} "
                             f"uid={uid_str} event_id={event['event_id']}",
                             flush=True,
+                        )
+                        self._send_report_ack(
+                            mid=mid,
+                            report_cmd=report_cmd,
+                            msg_id=report_msg_id,
+                            ok=True,
                         )
                         return
                     print(
@@ -4385,7 +5036,7 @@ class CmdRouter:
                         fft=fft_val,
                     )
 
-                    self._remember_node_seen(
+                    stored_rec = self._remember_node_seen(
                         mid=mid,
                         ts=ts,
                         uid=uid_str,
@@ -4415,6 +5066,8 @@ class CmdRouter:
                         },
                         "raw_valid_flags": valid_flags,
                         "measurement_parse_ok": usable_measurements,
+                        "temperature_parse_ok": temperature_parse_ok,
+                        "fft_parse_ok": fft_parse_ok,
                         "light_on": clean["light_on"],
                         "mode": event["mode"],
                         "reason": event["reason"],
@@ -4438,6 +5091,8 @@ class CmdRouter:
                             "event_rx_ts": event_rx_ts,
                             "fallback_ts": fallback_ts,
                             "measurement_parse_ok": usable_measurements,
+                            "temperature_parse_ok": temperature_parse_ok,
+                            "fft_parse_ok": fft_parse_ok,
                             "rtc": rtc_val,
                             "rtc_synced": event.get("rtc_synced") if valid_rtc else None,
                         },
@@ -4446,8 +5101,25 @@ class CmdRouter:
                         "rx_flags": flags,
                         "rx_ttl": ttl,
                     }
-                    self.mqtt.publish_json(topic_light_state, resp)
+                    publish_info = self.mqtt.publish_json(topic_light_state, resp)
                     _verbose_print("[MQTT TX LIGHT_STATE_EVENT]", resp)
+                    save_ok = (
+                        (self.store is None or bool(stored_rec))
+                        and self._mqtt_publish_queued(publish_info)
+                    )
+                    if save_ok:
+                        self._should_drop_duplicate_uplink(
+                            "light_state_event",
+                            mid,
+                            (uid_str, int(event["event_id"])),
+                            window_sec=self.report_dedupe_window_sec,
+                        )
+                    self._send_report_ack(
+                        mid=mid,
+                        report_cmd=report_cmd,
+                        msg_id=report_msg_id,
+                        ok=save_ok,
+                    )
                     return
 
                 if len(body) >= GET_CH_BIN_SIZE and body[0] == GET_CH_T:
@@ -4535,11 +5207,31 @@ class CmdRouter:
                     self.mqtt.publish_json(topic_cmd("get_node_info"), resp)
                     _verbose_print("[MQTT TX GET_NODE_INFO_ACK]", resp)
                     return
-                # 1) AckBin (body[0] == 0x10)
-                if len(body) >= ACK_BIN_SIZE and body[0] in (ACK_T, ACK_NODE_CFG_T):
+                # 1) AckBin / PowerCtrlAckBin
+                #    generic/set_setting: 0x10, node_cfg: 0x20,
+                #    light off: 0x32, light on: 0x33
+                if len(body) >= ACK_BIN_SIZE and body[0] in ACK_TYPES:
                     ack_schedule = {}
+                    ack_power = {}
                     try:
-                        if body[0] == ACK_T and len(body) >= SET_SETTING_ACK_V2_SIZE:
+                        if body[0] in LIGHT_ACK_TYPES:
+                            if len(body) < POWER_CTRL_ACK_SIZE:
+                                raise struct.error(
+                                    f"short PowerCtrlAckBin: need={POWER_CTRL_ACK_SIZE} got={len(body)}"
+                                )
+                            (
+                                t_val, uid_bytes, msg_id32, ok, err_code,
+                                ack_light_on,
+                            ) = struct.unpack(
+                                POWER_CTRL_ACK_FMT,
+                                body[:POWER_CTRL_ACK_SIZE],
+                            )
+                            ack_power = {
+                                "ack_type": "light_on_ack" if t_val == LIGHT_ON_ACK_T else "light_off_ack",
+                                "light_on": int(ack_light_on),
+                                "status": int(ack_light_on),
+                            }
+                        elif body[0] in (ACK_T, SET_SETTING_ACK_T) and len(body) >= SET_SETTING_ACK_V2_SIZE:
                             (
                                 t_val, uid_bytes, msg_id32, ok, err_code,
                                 ack_mode, ack_coord_type,
@@ -4551,6 +5243,7 @@ class CmdRouter:
                                 body[:SET_SETTING_ACK_V2_SIZE],
                             )
                             ack_schedule = {
+                                "ack_type": "set_setting_ack_0x31" if int(t_val) == SET_SETTING_ACK_T else "set_setting_ack_0x10",
                                 "mode": int(ack_mode),
                                 "apply_coord_type": int(ack_coord_type),
                                 "applied_lat_e7": int(ack_lat_e7),
@@ -4593,12 +5286,64 @@ class CmdRouter:
                     uid_str = uid_bytes.hex()
                     self._remember_node_seen(mid=mid, ts=ts, uid=uid_str, mac=mac)
                     result = "success" if ok else "fail"
-                    
-                    match_id = int(node_msg_id) if node_msg_id is not None else int(msg_id32 & 0xFFFF)
+                    body_msg_id16 = int(msg_id32) & 0xFFFF
+                    match_id = int(node_msg_id) if node_msg_id is not None else body_msg_id16
+                    is_setting_ack_wire = (
+                        cmd_code == CMD_SETTING_ACK_TRANSPORT
+                        and int(t_val) == ACK_T
+                        and node_msg_id is not None
+                        and (int(node_msg_id) & 0xFFFF) == body_msg_id16
+                    )
+                    if int(t_val) in LIGHT_ACK_TYPES:
+                        pend = self._pending_pop_power_ack(
+                            mid,
+                            match_id,
+                            int(t_val),
+                            int(ack_power.get("light_on", -1)),
+                            uid_str,
+                            int(ok),
+                        )
+                    elif is_setting_ack_wire:
+                        pend = self._pending_pop_setting_ack(mid, body_msg_id16, uid_str)
+                    else:
+                        pend = self._pending_pop_ack(mid, match_id)
 
-                    pend = self._pending_pop_ack(mid, match_id)
-                    api = pend["api"] if pend else "unknown"
+                    if int(t_val) in LIGHT_ACK_TYPES and pend is None:
+                        self.log.warning(
+                            "ignore unmatched power ACK mid=%s msg_id=%s type=0x%02X "
+                            "light_on=%s uid=%s ok=%s",
+                            mid, match_id, int(t_val),
+                            ack_power.get("light_on"), uid_str, int(ok),
+                        )
+                        return
+
+                    if cmd_code == CMD_SETTING_ACK_TRANSPORT and pend is None:
+                        self.log.warning(
+                            "ignore unmatched SET_SETTING_ACK mid=%s transport_msg_id=%s "
+                            "body_type=0x%02X body_msg_id=%s uid=%s ok=%s",
+                            mid, node_msg_id, int(t_val), body_msg_id16, uid_str, int(ok),
+                        )
+                        return
+
+                    api = pend["api"] if pend else (
+                        "set_power_ctrl" if t_val in LIGHT_ACK_TYPES else "unknown"
+                    )
                     pend_meta = pend.get("meta") if pend else {}
+                    if pend and (pend_meta or {}).get("requires_setting_ack"):
+                        ack_schedule["confirmation"] = "set_setting_ack"
+                        ack_schedule["transport_cmd"] = CMD_SETTING_ACK_TRANSPORT
+                        ack_schedule["applied"] = bool(ok)
+                        interval_sec = (pend_meta or {}).get("tx_interval")
+                        if ok:
+                            self._set_node_watchdog_interval(
+                                mid, interval_sec, reason="set_setting_ack"
+                            )
+                        else:
+                            previous_interval = (pend_meta or {}).get("previous_interval")
+                            if previous_interval is not None:
+                                self._set_node_watchdog_interval(
+                                    mid, previous_interval, reason="set_setting_nack_rollback"
+                                )
                     batch_id = (pend_meta or {}).get("batch_id")
                     if batch_id:
                         self._batch_record_node_result(
@@ -4609,7 +5354,7 @@ class CmdRouter:
                             err_code=int(err_code),
                             uid=uid_str,
                             ts=ts,
-                            ack_data=ack_schedule,
+                            ack_data=(ack_schedule or ack_power),
                         )
                         self.log.info(
                             "UL batch ack api=%s batch=%s mid=%d node_msg_id=%s result=%s err=%d",
@@ -4642,6 +5387,12 @@ class CmdRouter:
                         resp.update(pend["meta"])
                     if ack_schedule:
                         resp.update(ack_schedule)
+                    if ack_power:
+                        resp["ack_type"] = ack_power["ack_type"]
+                        resp["data"] = {
+                            "status": ack_power["status"],
+                            "light_on": ack_power["light_on"],
+                        }
 
                     self.mqtt.publish_json(topic_cmd(api), resp)
                     self.log.info("UL ack api=%s mid=%d node_msg_id=%s result=%s err=%d",
@@ -4774,7 +5525,13 @@ class CmdRouter:
                         })
                         return
 
-                    uid_str = snap["uid_bytes"].hex()                    
+                    uid_str = snap["uid_bytes"].hex()
+                    report_cmd = int(cmd_code) if cmd_code is not None else CMD_PERIODIC_SNAP_REPORT
+                    # Compact SNAP defines its ACK id as snap_count16 at body[35:37].
+                    if snap.get("ttl") is not None and len(body) >= 37:
+                        report_msg_id = int.from_bytes(body[35:37], "little", signed=False)
+                    else:
+                        report_msg_id = int(snap.get("snap_count") or 0) & 0xFFFF
                     fft1 = snap["fft_pairs"][0] if len(snap.get("fft_pairs", [])) >= 1 else (None, None)
                     fft2 = snap["fft_pairs"][1] if len(snap.get("fft_pairs", [])) >= 2 else (None, None)
 
@@ -4822,11 +5579,23 @@ class CmdRouter:
                         )
                         return
 
-                    if self._should_drop_duplicate_uplink("snap", mid, bytes(body)):
+                    if self._should_drop_duplicate_uplink(
+                        "snap",
+                        mid,
+                        (uid_str, report_msg_id),
+                        window_sec=self.report_dedupe_window_sec,
+                        record=False,
+                    ):
                         _verbose_print(
                             f"[GW DEDUPE] drop duplicate snap mid={mid} uid={uid_str} "
                             f"snap_count={snap.get('snap_count')} msg_id32={snap.get('msg_id32')}",
                             flush=True,
+                        )
+                        self._send_report_ack(
+                            mid=mid,
+                            report_cmd=report_cmd,
+                            msg_id=report_msg_id,
+                            ok=True,
                         )
                         return
                     print(
@@ -4842,8 +5611,8 @@ class CmdRouter:
                         f"snap_count={snap.get('snap_count')} msg_id32={snap.get('msg_id32')} "
                         f"ok={snap.get('ok')} err={snap.get('err_code')} "
                         f"ai_valid={snap.get('ai_valid')} ai_mse={snap.get('ai_mse')} "
-                        f"ai_pred={snap.get('ai_pred')} flags={snap.get('flags')} "
-                        f"control_mode={snap.get('control_mode')} "
+                        f"ai_pred={snap.get('ai_pred')} rul_percent={snap.get('rul_percent')} "
+                        f"flags={snap.get('flags')} control_mode={snap.get('control_mode')} "
                         f"on_time_min={snap.get('on_time_min')} off_time_min={snap.get('off_time_min')}",
                         flush=True,
                     )
@@ -4916,7 +5685,7 @@ class CmdRouter:
                         flush=True,
                     )
 
-                    self._remember_node_seen(
+                    stored_rec = self._remember_node_seen(
                         mid=mid,
                         ts=ts,
                         uid=uid_str,
@@ -4929,8 +5698,10 @@ class CmdRouter:
                         ai_valid=snap.get("ai_valid"),
                         ai_mse=snap.get("ai_mse"),
                         ai_pred=snap.get("ai_pred"),
+                        rul_percent=snap.get("rul_percent"),
+                        rul_present=snap.get("rul_present", False),
                     )
-                    self._publish_direct_node_snap(
+                    publish_queued = self._publish_direct_node_snap(
                         mid=mid,
                         ts=ts,
                         uid=uid_str,
@@ -4943,6 +5714,7 @@ class CmdRouter:
                         ai_valid=snap.get("ai_valid"),
                         ai_mse=snap.get("ai_mse"),
                         ai_pred=snap.get("ai_pred"),
+                        rul_percent=snap.get("rul_percent"),
                         measurement_source="uplink_snap_bin",
                         extra={
                             "snap_count": snap.get("snap_count"),
@@ -4967,6 +5739,21 @@ class CmdRouter:
 
                     with self._snap_cycle_lock:
                         self._snap_cycle_seen_mids.add(mid)
+
+                    save_ok = (self.store is None or bool(stored_rec)) and bool(publish_queued)
+                    if save_ok:
+                        self._should_drop_duplicate_uplink(
+                            "snap",
+                            mid,
+                            (uid_str, report_msg_id),
+                            window_sec=self.report_dedupe_window_sec,
+                        )
+                    self._send_report_ack(
+                        mid=mid,
+                        report_cmd=report_cmd,
+                        msg_id=report_msg_id,
+                        ok=save_ok,
+                    )
 
                     return
 

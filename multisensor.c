@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -23,6 +24,7 @@
 #define LIS3DH_SCALE_16G 0.012
 
 #define LIS3DH_RANGE LIS3DH_SCALE_2G 
+#define SENSOR_ERROR_VALUE -999.0
 
 #define LIS3DH_I2C_ADDR 0x19
 #define I2C_BUS 1
@@ -52,14 +54,21 @@ void init_lis3dhtr() {
     time_sleep(0.1);  // 안정화 대기
 }
 
-void read_lis3dhtr_axes(double *x, double *y, double *z) {
-    uint8_t xl, xh, yl, yh, zl, zh;
+bool read_lis3dhtr_axes(double *x, double *y, double *z) {
+    int xl, xh, yl, yh, zl, zh;
     xl = i2cReadByteData(lis3dh_handle, 0x28);
     xh = i2cReadByteData(lis3dh_handle, 0x29);
     yl = i2cReadByteData(lis3dh_handle, 0x2A);
     yh = i2cReadByteData(lis3dh_handle, 0x2B);
     zl = i2cReadByteData(lis3dh_handle, 0x2C);
     zh = i2cReadByteData(lis3dh_handle, 0x2D);
+
+    if (xl < 0 || xh < 0 || yl < 0 || yh < 0 || zl < 0 || zh < 0) {
+        *x = SENSOR_ERROR_VALUE;
+        *y = SENSOR_ERROR_VALUE;
+        *z = SENSOR_ERROR_VALUE;
+        return false;
+    }
 
     int16_t raw_x = (int16_t)(xh << 8 | xl) >> 4;
     int16_t raw_y = (int16_t)(yh << 8 | yl) >> 4;
@@ -68,6 +77,7 @@ void read_lis3dhtr_axes(double *x, double *y, double *z) {
     *x = raw_x * LIS3DH_RANGE;
     *y = raw_y * LIS3DH_RANGE;
     *z = raw_z * LIS3DH_RANGE;
+    return true;
 }
 
 int main() {
@@ -94,31 +104,46 @@ int main() {
         time_sleep(0.5);
 
         unsigned char dataFromSensor[26];
+        bool env_sensor_ok = true;
         for (int i = 0; i < 26; i++) {
-            dataFromSensor[i] = serReadByte(sensor_fd);
-        }
-
-        unsigned char receivedSensor[9];
-
-        for (int i = 0; i < 9; i++) {
-            receivedSensor[i] = serReadByte(h2s_fd);
+            int sensor_byte = serReadByte(sensor_fd);
+            if (sensor_byte < 0) {
+                env_sensor_ok = false;
+                dataFromSensor[i] = 0;
+            } else {
+                dataFromSensor[i] = (unsigned char)sensor_byte;
+            }
         }
 
         print_sensor_frame(dataFromSensor, sizeof(dataFromSensor));
 
-        double temp = ((dataFromSensor[11] * 256 + dataFromSensor[12]) - 500) * 0.1;
-        double humi = dataFromSensor[13] * 256 + dataFromSensor[14];
-        double pm25 = (dataFromSensor[4] * 256 + dataFromSensor[5]) / 10.0;
-        double pm10 = (dataFromSensor[6] * 256 + dataFromSensor[7]) / 10.0;
-        double pm1  = (dataFromSensor[2] * 256 + dataFromSensor[3]) / 10.0;
-        double co2  = (dataFromSensor[8] * 256 + dataFromSensor[9]);
-        double voc  = dataFromSensor[10];
-        double ch2o = (dataFromSensor[15] * 256 + dataFromSensor[16]) * 0.0001 / 10.0;
-        double co   = (dataFromSensor[17] * 256 + dataFromSensor[18]) * 0.1;
-        double o3   = (dataFromSensor[19] * 256 + dataFromSensor[20]) * 0.01;
-        double no2  = (dataFromSensor[21] * 256 + dataFromSensor[22]) * 0.01;
-//        double h2s  = (receivedSensor[2] * 256 + receivedSensor[3]) / 10.0;
+        double temp = SENSOR_ERROR_VALUE;
+        double humi = SENSOR_ERROR_VALUE;
+        double pm25 = SENSOR_ERROR_VALUE;
+        double pm10 = SENSOR_ERROR_VALUE;
+        double pm1  = SENSOR_ERROR_VALUE;
+        double co2  = SENSOR_ERROR_VALUE;
+        double voc  = SENSOR_ERROR_VALUE;
+        double ch2o = SENSOR_ERROR_VALUE;
+        double co   = SENSOR_ERROR_VALUE;
+        double o3   = SENSOR_ERROR_VALUE;
+        double no2  = SENSOR_ERROR_VALUE;
 
+        if (env_sensor_ok) {
+            temp = ((dataFromSensor[11] * 256 + dataFromSensor[12]) - 500) * 0.1;
+            humi = dataFromSensor[13] * 256 + dataFromSensor[14];
+            pm25 = (dataFromSensor[4] * 256 + dataFromSensor[5]) / 10.0;
+            pm10 = (dataFromSensor[6] * 256 + dataFromSensor[7]) / 10.0;
+            pm1  = (dataFromSensor[2] * 256 + dataFromSensor[3]) / 10.0;
+            co2  = (dataFromSensor[8] * 256 + dataFromSensor[9]);
+            voc  = dataFromSensor[10];
+            ch2o = (dataFromSensor[15] * 256 + dataFromSensor[16]) * 0.0001 / 10.0;
+            co   = (dataFromSensor[17] * 256 + dataFromSensor[18]) * 0.1;
+            o3   = (dataFromSensor[19] * 256 + dataFromSensor[20]) * 0.01;
+            no2  = (dataFromSensor[21] * 256 + dataFromSensor[22]) * 0.01;
+        } else {
+            fprintf(stderr, "[ENV] sensor read failed; publishing -999 values\n");
+        }
         printf(
             "[ENV GAS RAW] O3_H=%u O3_L=%u O3=%.2f ppm, NO2_H=%u NO2_L=%u NO2=%.2f ppm\n",
             dataFromSensor[19], dataFromSensor[20], o3,
@@ -128,7 +153,10 @@ int main() {
         printf("[ENV] Temp: %.2f\u00b0C, Humi: %.2f%%, PM2.5: %.2f, CO2: %.0f\n",
                temp, humi, pm25, co2);
         double ax, ay, az;
-        read_lis3dhtr_axes(&ax, &ay, &az);
+        bool accel_sensor_ok = read_lis3dhtr_axes(&ax, &ay, &az);
+        if (!accel_sensor_ok) {
+            fprintf(stderr, "[ENV] accelerometer read failed; publishing -999 values\n");
+        }
         printf("LIS3DHTR -> X: %.3fg, Y: %.3fg, Z: %.3fg\n", ax, ay, az);
 
         time_t now = time(NULL);

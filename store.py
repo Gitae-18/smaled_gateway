@@ -187,6 +187,8 @@ class NodeStore:
             ai_valid: Optional[int] = None,
             ai_mse: Optional[float] = None,
             ai_pred: Optional[int] = None,
+            rul_percent: Optional[float] = None,
+            clear_rul_percent: bool = False,
             last_good_temperature: Optional[float] = None,
             last_good_fft: Optional[Sequence[Sequence[float]]] = None,
             last_good_measurement_ts: Optional[float] = None,
@@ -253,6 +255,11 @@ class NodeStore:
                 "ai_pred": (
                     int(ai_pred) if ai_pred is not None else old.get("ai_pred")
                 ),
+                "rul_percent": (
+                    None if clear_rul_percent
+                    else float(rul_percent) if rul_percent is not None
+                    else old.get("rul_percent")
+                ),
                 "last_good_temperature": (
                     last_good_temperature
                     if last_good_temperature is not None
@@ -283,6 +290,39 @@ class NodeStore:
 
             self._atomic_save()
             return rec
+
+    def update_interval_by_mid(self, mid: int, interval: int) -> int:
+        """
+        Update only the configured SNAP interval for a MID.
+        rec["ts"], last_snap_ts and measurement timestamps are intentionally preserved.
+        """
+        try:
+            target_mid = int(mid or 0)
+            interval_sec = int(interval)
+        except (TypeError, ValueError):
+            return 0
+        if target_mid <= 0 or interval_sec <= 0:
+            return 0
+
+        matched = 0
+        changed = False
+        with self._lock:
+            for rec in self._by_key.values():
+                try:
+                    rec_mid = int(rec.get("mid") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if rec_mid != target_mid:
+                    continue
+
+                matched += 1
+                if int(rec.get("interval") or 0) != interval_sec:
+                    rec["interval"] = interval_sec
+                    changed = True
+
+            if changed:
+                self._atomic_save()
+        return matched
 
     def mark_sent_for_mids(self, mids: Sequence[int], sent_ts: Optional[float] = None) -> int:
         when = sent_ts if sent_ts is not None else time.time()
