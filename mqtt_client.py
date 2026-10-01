@@ -327,6 +327,7 @@ class MqttBridge:
         # 기존 게이트웨이 명령 구독
         gw_cmd = f"gw/{self.client_id}/#"
         node_cmd = f"node/{self.client_id}/ctrl/#"
+        firmware_version_cmd = "node/+/firmware/get_version"
         #node_cmd_legacy = f"node/{self.client_id}/#" 
         prov_rsp = f"{PROVISIONING_RESPONSE_PREFIX}/{self.client_id}"
         try:
@@ -334,14 +335,19 @@ class MqttBridge:
             self._sub_mid_map[mid] = gw_cmd
             r, mid = client.subscribe(node_cmd, qos=1)
             self._sub_mid_map[mid] = node_cmd
+            r, mid = client.subscribe(firmware_version_cmd, qos=1)
+            self._sub_mid_map[mid] = firmware_version_cmd
 
             r, mid = client.subscribe(f"{PROVISIONING_RESPONSE_PREFIX}/{self.client_id}", qos=1)
             self._sub_mid_map[mid] = f"{PROVISIONING_RESPONSE_PREFIX}/{self.client_id}"
             self.publish_gateway_status("online", reason="mqtt_connect")
             if self.router:
                 self.router.publish_node_inventory(reason="mqtt_connect")
-            print(f"[MQTT] connected rc=0, sub: {gw_cmd},{node_cmd}, {PROVISIONING_RESPONSE_PREFIX}/{self.client_id}")
-            self.log.info("mqtt connected rc=0 subs=[%s,%s,%s]", gw_cmd, node_cmd, prov_rsp)
+            print(f"[MQTT] connected rc=0, sub: {gw_cmd},{node_cmd},{firmware_version_cmd}, {PROVISIONING_RESPONSE_PREFIX}/{self.client_id}")
+            self.log.info(
+                "mqtt connected rc=0 subs=[%s,%s,%s,%s]",
+                gw_cmd, node_cmd, firmware_version_cmd, prov_rsp,
+            )
         except Exception:
             self.log.exception("mqtt on_connect exception")
   

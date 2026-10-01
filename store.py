@@ -117,6 +117,46 @@ class NodeStore:
             # 깨졌으면 그냥 빈 상태로 시작
             self._by_key = {}
 
+        # Older versions used (uid, mid) as the identity key, so one physical
+        # node could remain in the store more than once after a MID change.
+        # Keep only the newest record for each UID when loading that data.
+        newest_by_uid = {}
+        for rec_key, rec in self._by_key.items():
+            uid = rec.get("uid") if isinstance(rec, dict) else None
+            if not uid:
+                continue
+            previous = newest_by_uid.get(uid)
+            if previous is None or rec.get("ts", 0) >= previous[1].get("ts", 0):
+                newest_by_uid[uid] = (rec_key, rec)
+        keep_keys = {item[0] for item in newest_by_uid.values()}
+        for rec_key, rec in list(self._by_key.items()):
+            if isinstance(rec, dict) and rec.get("uid") and rec_key not in keep_keys:
+                self._by_key.pop(rec_key, None)
+
+        # A MID is exclusive too. Clean legacy/manual reassignment data where
+        # the old UID and its replacement both own the same MID.
+        newest_by_mid = {}
+        for rec_key, rec in self._by_key.items():
+            if not isinstance(rec, dict):
+                continue
+            try:
+                mid = int(rec.get("mid") or 0)
+            except (TypeError, ValueError):
+                continue
+            if mid <= 0:
+                continue
+            previous = newest_by_mid.get(mid)
+            if previous is None or rec.get("ts", 0) >= previous[1].get("ts", 0):
+                newest_by_mid[mid] = (rec_key, rec)
+        keep_mid_keys = {item[0] for item in newest_by_mid.values()}
+        for rec_key, rec in list(self._by_key.items()):
+            try:
+                mid = int(rec.get("mid") or 0) if isinstance(rec, dict) else 0
+            except (TypeError, ValueError):
+                mid = 0
+            if mid > 0 and rec_key not in keep_mid_keys:
+                self._by_key.pop(rec_key, None)
+
     def _drop_other_records_with_same_mid(self, mid: Optional[int], keep_key: str) -> None:
         """
         새 uplink가 들어오면 같은 mid의 이전 레코드는 제거한다.
@@ -200,15 +240,34 @@ class NodeStore:
             # 저장은 하지 않고, 빈 dict 반환 (호출부에서 굳이 안 쓰면 됨)
             return {}
         
-        key = self._mk_key(uid, mid)
         now = ts if ts is not None else time.time()
 
         with self._lock:
-            old = self._by_key.get(key, {})
+            uid_matches = [
+                (rec_key, rec)
+                for rec_key, rec in self._by_key.items()
+                if uid is not None and rec.get("uid") == uid
+            ]
+            old_key = None
+            old = {}
+            if uid_matches:
+                old_key, old = max(uid_matches, key=lambda item: item[1].get("ts", 0))
+
+            # While a MID reassignment is pending, uplinks may already arrive
+            # on the new MID. Merge their data without changing ownership;
+            # ownership is committed only by confirm_mid_change().
+            canonical_mid = mid
+            if old and old.get("pending_mid") is not None:
+                try:
+                    if int(mid or 0) == int(old.get("pending_mid") or 0):
+                        canonical_mid = old.get("mid")
+                except (TypeError, ValueError):
+                    pass
+            key = self._mk_key(uid, canonical_mid)
         
             rec: Dict[str, Any] = {
                 "uid": uid if uid is not None else old.get("uid"),
-                "mid": mid if mid is not None else old.get("mid"),
+                "mid": canonical_mid if canonical_mid is not None else old.get("mid"),
                 "mac": mac if mac is not None else old.get("mac"),
                 "ultrasonic": (
                     ultrasonic if ultrasonic is not None else old.get("ultrasonic")
@@ -275,10 +334,19 @@ class NodeStore:
                     if last_good_measurement_ts is not None
                     else old.get("last_good_measurement_ts")
                 ),
+                "pending_mid": old.get("pending_mid"),
+                "pending_channel": old.get("pending_channel"),
+                "pending_mid_since": old.get("pending_mid_since"),
+                "pending_mid_expires_ts": old.get("pending_mid_expires_ts"),
             }
 
+            # UID is the physical identity. Remove every older (uid, mid)
+            # record before writing its single canonical record.
+            for rec_key, _existing in uid_matches:
+                if rec_key != key:
+                    self._by_key.pop(rec_key, None)
             self._by_key[key] = rec
-            self._drop_other_records_with_same_mid(mid, keep_key=key)
+            self._drop_other_records_with_same_mid(canonical_mid, keep_key=key)
 
             # 용량 초과 시 LRU 제거
             if len(self._by_key) > self.cap:
@@ -393,6 +461,159 @@ class NodeStore:
             best = max(candidates, key=lambda r: r.get("ts", 0))
             return dict(best)
         
+    def begin_mid_change(
+            self,
+            uid: str,
+            new_mid: int,
+            new_channel: Optional[int] = None,
+            ttl_sec: float = 10.0,
+        ) -> Dict[str, Any]:
+        """Record a requested MID change without changing current ownership."""
+        if not self._is_valid_uid(uid):
+            raise ValueError("invalid_uid")
+        try:
+            target_mid = int(new_mid)
+        except (TypeError, ValueError):
+            raise ValueError("invalid_mid")
+        if target_mid <= 0 or target_mid > 0xFFFF:
+            raise ValueError("invalid_mid")
+
+        now = time.time()
+        with self._lock:
+            candidates = [
+                (key, rec) for key, rec in self._by_key.items()
+                if rec.get("uid") == uid
+            ]
+            if not candidates:
+                raise ValueError("uid_not_found")
+
+            _current_key, current_rec = max(
+                candidates, key=lambda item: item[1].get("ts", 0)
+            )
+            if current_rec.get("pending_mid") is not None:
+                raise ValueError("mid_change_in_progress")
+
+            for rec in self._by_key.values():
+                if rec.get("uid") == uid:
+                    continue
+                try:
+                    occupied_mid = int(rec.get("mid") or 0)
+                    occupied_pending_mid = int(rec.get("pending_mid") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if target_mid in (occupied_mid, occupied_pending_mid):
+                    raise ValueError(f"mid_conflict:{target_mid}")
+
+            rec = current_rec
+            rec["pending_mid"] = target_mid
+            rec["pending_channel"] = (
+                int(new_channel) if new_channel is not None else rec.get("channel")
+            )
+            rec["pending_mid_since"] = now
+            rec["pending_mid_expires_ts"] = now + max(1.0, float(ttl_sec))
+            self._atomic_save()
+            return dict(rec)
+
+    def cancel_mid_change(self, uid: str) -> bool:
+        with self._lock:
+            matches = [rec for rec in self._by_key.values() if rec.get("uid") == uid]
+            if not matches:
+                return False
+            changed = False
+            for rec in matches:
+                for field in (
+                    "pending_mid", "pending_channel", "pending_mid_since",
+                    "pending_mid_expires_ts",
+                ):
+                    if rec.get(field) is not None:
+                        rec[field] = None
+                        changed = True
+            if changed:
+                self._atomic_save()
+            return changed
+
+    def confirm_mid_change(
+            self,
+            uid: str,
+            new_mid: int,
+            new_channel: Optional[int] = None,
+        ) -> Optional[Dict[str, Any]]:
+        """Atomically make a pending MID the UID's canonical MID."""
+        try:
+            target_mid = int(new_mid)
+        except (TypeError, ValueError):
+            return None
+
+        with self._lock:
+            candidates = [
+                (key, rec) for key, rec in self._by_key.items()
+                if rec.get("uid") == uid
+            ]
+            if not candidates:
+                return None
+            _old_key, old_rec = max(candidates, key=lambda item: item[1].get("ts", 0))
+            try:
+                pending_mid = int(old_rec.get("pending_mid") or 0)
+            except (TypeError, ValueError):
+                pending_mid = 0
+            if pending_mid != target_mid:
+                return None
+
+            for rec in self._by_key.values():
+                if rec.get("uid") == uid:
+                    continue
+                try:
+                    if int(rec.get("mid") or 0) == target_mid:
+                        return None
+                except (TypeError, ValueError):
+                    continue
+
+            rec = dict(old_rec)
+            rec["previous_mid"] = rec.get("mid")
+            rec["mid"] = target_mid
+            rec["channel"] = (
+                int(new_channel) if new_channel is not None
+                else rec.get("pending_channel", rec.get("channel"))
+            )
+            rec["mid_assigned"] = True
+            rec["ts"] = time.time()
+            for field in (
+                "pending_mid", "pending_channel", "pending_mid_since",
+                "pending_mid_expires_ts",
+            ):
+                rec[field] = None
+
+            for rec_key, _existing in candidates:
+                self._by_key.pop(rec_key, None)
+            new_key = self._mk_key(uid, target_mid)
+            self._by_key[new_key] = rec
+            self._atomic_save()
+            return dict(rec)
+
+    def allowed_mids_for_uid(self, uid: str, now: Optional[float] = None):
+        """Return current and still-valid pending MIDs for relay filtering."""
+        now_ts = time.time() if now is None else float(now)
+        with self._lock:
+            candidates = [rec for rec in self._by_key.values() if rec.get("uid") == uid]
+            if not candidates:
+                return set()
+            rec = max(candidates, key=lambda item: item.get("ts", 0))
+            allowed = set()
+            try:
+                current_mid = int(rec.get("mid") or 0)
+                if current_mid > 0:
+                    allowed.add(current_mid)
+            except (TypeError, ValueError):
+                pass
+            try:
+                pending_mid = int(rec.get("pending_mid") or 0)
+                expires = float(rec.get("pending_mid_expires_ts") or 0)
+                if pending_mid > 0 and expires >= now_ts:
+                    allowed.add(pending_mid)
+            except (TypeError, ValueError):
+                pass
+            return allowed
+
     def update_mid_chan(
             self,
             uid: str,
@@ -432,9 +653,16 @@ class NodeStore:
             rec["channel"] = new_channel if new_channel is not None else rec.get("channel")
             rec["mid_assigned"] = True
             rec["ts"] = time.time()
+            for field in (
+                "pending_mid", "pending_channel", "pending_mid_since",
+                "pending_mid_expires_ts",
+            ):
+                rec[field] = None
 
             # 4) 옮기기 (old_key 삭제 후 new_key에 넣기)
-            self._by_key.pop(old_key, None)
+            for candidate_key, _candidate_rec in candidates:
+                self._by_key.pop(candidate_key, None)
+            self._drop_other_records_with_same_mid(new_mid, keep_key=new_key)
             self._by_key[new_key] = rec
 
             # cap 체크는 없어도 거의 문제 없지만, 혹시 기존 로직 맞추고 싶으면 넣어도 됨

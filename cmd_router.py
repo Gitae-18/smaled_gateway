@@ -47,6 +47,7 @@ CMD_SET_NODE_INFO      = 0x29
 CMD_SET_TIME_INTERVAL  = 0x2A
 CMD_SET_RTC_KST        = 0x2B
 CMD_SET_ASTRO_SETTING  = 0x45
+CMD_GET_VERSION        = 0x46
 
 T_SNAP = 0x01
 T_LIGHT_STATE_EVENT = 0x15
@@ -1301,6 +1302,10 @@ class CmdRouter:
             "uid": {},   
         }
         self.pending = defaultdict(deque)
+        self.pending_mid_changes = {}
+        self._mid_change_lock = threading.Lock()
+        self.pending_firmware_versions = {}
+        self._firmware_version_lock = threading.Lock()
         self.pending_batches = {}
         self._batch_lock = threading.Lock()
         self.log = logging.getLogger("gw")
@@ -1586,6 +1591,26 @@ class CmdRouter:
             parts = topic.split("/")
             root = parts[0] if len(parts) > 0 else ""
             gw_id = parts[1] if len(parts) > 1 else None
+            firmware_device_index = None
+            if (
+                root == "node"
+                and len(parts) >= 4
+                and parts[2] == "firmware"
+                and parts[3] == "get_version"
+            ):
+                firmware_device_index = parts[1]
+                try:
+                    topic_mid = int(firmware_device_index)
+                except (TypeError, ValueError):
+                    print(
+                        f"[CMD_ROUTER] invalid firmware device_index={firmware_device_index} "
+                        f"topic={topic}",
+                        flush=True,
+                    )
+                    return
+                payload = dict(payload)
+                payload["mid"] = topic_mid
+                cmd = "get_version"
             raw_msg_id = payload.get("msg_id")
             try:
                 msg_id_int = int(raw_msg_id) if raw_msg_id is not None else (int(time.time() * 1000) & 0xFFFFFFFF)
@@ -2922,6 +2947,9 @@ class CmdRouter:
             except Exception:
                 _node_fail("set_mid_chan", "bad_mid_or_ch")
                 return
+            if not (1 <= new_mid <= 0xFFFF) or not (0 <= new_ch <= 0xFF):
+                _node_fail("set_mid_chan", "bad_mid_or_ch")
+                return
 
             try:
                 uid_bytes = bytes.fromhex(str(target_uid))
@@ -2937,7 +2965,27 @@ class CmdRouter:
             extra.append(new_mid & 0xFF)
             extra.append(new_ch & 0xFF)
 
+            mid_change_started = False
             try:
+                if self.store is None or not hasattr(self.store, "begin_mid_change"):
+                    raise RuntimeError("mid_change_store_unavailable")
+                pending_rec = self.store.begin_mid_change(
+                    uid_bytes.hex(), new_mid, new_ch, ttl_sec=10.0
+                )
+                mid_change_started = True
+                change_key = (uid_bytes.hex().lower(), int(msg_id_int) & 0xFFFF)
+                with self._mid_change_lock:
+                    self.pending_mid_changes[change_key] = {
+                        "api": "set_mid_chan",
+                        "srv_msg_id": raw_msg_id,
+                        "tx_msg_id": int(msg_id_int) & 0xFFFF,
+                        "uid": uid_bytes.hex().lower(),
+                        "old_mid": int(pending_rec.get("mid") or 0),
+                        "new_mid": new_mid,
+                        "new_channel": new_ch,
+                        "t": self._now(),
+                        "ttl": 10.0,
+                    }
                 self.wisun.send_cmd_bytes(0, CMD_SET_MID_CH, msg_id=msg_id_int, flags=0x00, extra=bytes(extra))
                 _publish_node("set_mid_chan", {
                     "cmd": "set_mid_chan_ack",
@@ -2946,11 +2994,17 @@ class CmdRouter:
                     "mid": new_mid,
                     "ch": new_ch,
                     "msg_id": raw_msg_id,
-                    "result": "success",
+                    "result": "pending",
+                    "applied": False,
                     "queued": True,
                 })
                 _verbose_print(f"[CMD] set_mid_chan → UID={uid_bytes.hex()} MID={new_mid} CH={new_ch}, msg_id={msg_id_int}")
             except Exception as e:
+                if 'change_key' in locals():
+                    with self._mid_change_lock:
+                        self.pending_mid_changes.pop(change_key, None)
+                if mid_change_started and self.store is not None and hasattr(self.store, "cancel_mid_change"):
+                    self.store.cancel_mid_change(uid_bytes.hex())
                 _node_fail("set_mid_chan", f"send_error:{e}")
 
         def _node_setid_key():
@@ -2992,6 +3046,49 @@ class CmdRouter:
         def _node_get_all_status():
             self._handle_get_all_status(payload)
 
+        def _node_get_version():
+            try:
+                mid = int(payload.get("mid", 0) or 0)
+            except (TypeError, ValueError):
+                mid = 0
+            if not (1 <= mid <= 0xFFFF):
+                print(f"[FW VERSION] invalid target mid={mid} topic={topic}", flush=True)
+                return
+
+            tx_msg_id16 = int(msg_id_int) & 0xFFFF
+            device_index = str(firmware_device_index if firmware_device_index is not None else mid)
+            pending_key = (mid, tx_msg_id16)
+            pending_item = {
+                "mid": mid,
+                "device_index": device_index,
+                "srv_msg_id": raw_msg_id,
+                "tx_msg_id": tx_msg_id16,
+                "t": self._now(),
+                "ttl": 10.0,
+            }
+            try:
+                with self._firmware_version_lock:
+                    self.pending_firmware_versions[pending_key] = pending_item
+                self.wisun.send_cmd_bytes(
+                    mid,
+                    CMD_GET_VERSION,
+                    msg_id=tx_msg_id16,
+                    flags=0x00,
+                    extra=b"",
+                )
+                print(
+                    f"[FW VERSION REQUEST] mid={mid} device_index={device_index} "
+                    f"msg_id={raw_msg_id} tx_msg_id={tx_msg_id16}",
+                    flush=True,
+                )
+            except Exception as e:
+                with self._firmware_version_lock:
+                    self.pending_firmware_versions.pop(pending_key, None)
+                print(
+                    f"[FW VERSION REQUEST ERROR] mid={mid} msg_id={raw_msg_id} err={e}",
+                    flush=True,
+                )
+
         node_handlers = {
             "get_node_status": _node_get_status,
             "set_setting": _node_set_setting,
@@ -3001,6 +3098,7 @@ class CmdRouter:
             "setid_key": _node_setid_key,
             "ping": _node_ping,
             "get_all_status": _node_get_all_status,
+            "get_version": _node_get_version,
             
             "get_fft_data":         _node_get_fft_data_cached,
             "get_voltage_current":  _node_get_voltage_current_cached,
@@ -3907,12 +4005,31 @@ class CmdRouter:
         if prev is not None and uid is not None and update_source not in ("snap", "event"):
             prev_uid = prev.get("uid")
             if prev_uid and prev_uid != uid:
-                _verbose_print(
-                    f"[NODE_SEEN UID GUARD] mid={mid_int} source={update_source} "
-                    f"ignore_uid={uid} keep_uid={prev_uid} mac={mac} prev_mac={prev.get('mac')}",
-                    flush=True,
-                )
-                uid_to_store = prev_uid
+                incoming_owner = None
+                try:
+                    incoming_owner = self.store.get_by_uid(uid)
+                except Exception:
+                    incoming_owner = None
+                try:
+                    incoming_owner_mid = int(
+                        incoming_owner.get("mid") or 0
+                    ) if isinstance(incoming_owner, dict) else 0
+                except (TypeError, ValueError):
+                    incoming_owner_mid = 0
+
+                if incoming_owner_mid == mid_int:
+                    _verbose_print(
+                        f"[NODE_SEEN UID REPLACE] mid={mid_int} source={update_source} "
+                        f"old_uid={prev_uid} new_uid={uid}",
+                        flush=True,
+                    )
+                else:
+                    _verbose_print(
+                        f"[NODE_SEEN UID GUARD] mid={mid_int} source={update_source} "
+                        f"ignore_uid={uid} keep_uid={prev_uid} mac={mac} prev_mac={prev.get('mac')}",
+                        flush=True,
+                    )
+                    uid_to_store = prev_uid
 
         # clean 값 중 하나라도 유효하면 측정값 있음.
         # 단, temperature=-999만 들어오면 clean temperature는 None이라
@@ -4049,6 +4166,133 @@ class CmdRouter:
             "ttl": float(ttl_sec),
             "meta": dict(meta or {}),
         })
+
+    def _pop_pending_mid_change(self, uid: str, tx_msg_id: int):
+        key = (str(uid or "").lower(), int(tx_msg_id) & 0xFFFF)
+        with self._mid_change_lock:
+            item = self.pending_mid_changes.get(key)
+            if item is None:
+                return None
+            if (self._now() - item["t"]) > item["ttl"]:
+                self.pending_mid_changes.pop(key, None)
+                return None
+            return self.pending_mid_changes.pop(key, None)
+
+    def _expire_pending_mid_changes(self, now: float):
+        expired = []
+        with self._mid_change_lock:
+            for key, item in list(self.pending_mid_changes.items()):
+                if (now - item["t"]) > item["ttl"]:
+                    expired.append(item)
+                    self.pending_mid_changes.pop(key, None)
+        for item in expired:
+            uid = item["uid"]
+            if self.store is not None and hasattr(self.store, "cancel_mid_change"):
+                self.store.cancel_mid_change(uid)
+            self._ack_fail(
+                item["api"], item.get("srv_msg_id"), item.get("old_mid", 0),
+                "ack_timeout",
+            )
+
+    def _pop_pending_firmware_version(self, mid: int, tx_msg_id: int):
+        key = (int(mid), int(tx_msg_id) & 0xFFFF)
+        with self._firmware_version_lock:
+            item = self.pending_firmware_versions.get(key)
+            if item is None:
+                return None
+            if (self._now() - item["t"]) > item["ttl"]:
+                self.pending_firmware_versions.pop(key, None)
+                return None
+            return self.pending_firmware_versions.pop(key, None)
+
+    def _expire_pending_firmware_versions(self, now: float):
+        expired = []
+        with self._firmware_version_lock:
+            for key, item in list(self.pending_firmware_versions.items()):
+                if (now - item["t"]) > item["ttl"]:
+                    expired.append(item)
+                    self.pending_firmware_versions.pop(key, None)
+        for item in expired:
+            print(
+                f"[FW VERSION TIMEOUT] mid={item.get('mid')} "
+                f"msg_id={item.get('srv_msg_id')}",
+                flush=True,
+            )
+
+    def _handle_firmware_version_uplink(
+        self,
+        *,
+        rx_mid: int,
+        body: bytes,
+        node_msg_id: int | None,
+        ts: int,
+    ) -> None:
+        try:
+            decoded = bytes(body).decode("ascii").strip("\x00\r\n \t")
+            data = json.loads(decoded)
+            if not isinstance(data, dict):
+                raise ValueError("JSON body must be an object")
+            reported_mid = int(data.get("mid", data.get("m")) or 0)
+            if not (1 <= reported_mid <= 0xFFFF):
+                raise ValueError("missing_or_invalid_mid")
+            app_fw_value = data.get("app_fw", data.get("f"))
+            ai_version_value = data.get("ai_version", data.get("a"))
+            if app_fw_value is None or ai_version_value is None:
+                raise ValueError("missing_firmware_version")
+            app_fw = str(app_fw_value)
+            ai_version = str(ai_version_value)
+        except Exception as e:
+            print(
+                f"[FW VERSION PARSE ERROR] rx_mid={rx_mid} msg_id={node_msg_id} "
+                f"err={e} body={bytes(body).hex(' ')}",
+                flush=True,
+            )
+            return
+
+        reason = str(data.get("reason", data.get("r")) or "").strip().lower()
+        pending = None
+        correlation_msg_id = data.get("msg_id", data.get("i", node_msg_id))
+        if reason != "boot" and correlation_msg_id is not None:
+            try:
+                pending = self._pop_pending_firmware_version(
+                    reported_mid, int(correlation_msg_id)
+                )
+            except (TypeError, ValueError):
+                pending = None
+        if pending is not None:
+            reason = "request"
+        elif reason not in ("boot", "request"):
+            try:
+                has_msg_id = int(correlation_msg_id or 0) != 0
+            except (TypeError, ValueError):
+                has_msg_id = False
+            reason = "request" if has_msg_id else "boot"
+
+        device_index = (
+            str(pending.get("device_index")) if pending is not None
+            else str(reported_mid)
+        )
+        response = {
+            "mid": reported_mid,
+            "app_fw": app_fw,
+            "ai_version": ai_version,
+            "reason": reason,
+        }
+        if reason == "request":
+            response_msg_id = (
+                pending.get("srv_msg_id") if pending is not None
+                else correlation_msg_id
+            )
+            if response_msg_id not in (None, 0, "0", ""):
+                response["msg_id"] = response_msg_id
+
+        topic = f"node/{device_index}/firmware/status"
+        self.mqtt.publish_json(topic, response)
+        print(
+            f"[FW VERSION STATUS] topic={topic} rx_mid={rx_mid} "
+            f"msg_id={node_msg_id} payload={response}",
+            flush=True,
+        )
 
     def _set_node_watchdog_interval(self, mid: int, interval_sec, *, reason: str) -> bool:
         """Persist expected SNAP interval without making the node look newly seen."""
@@ -4317,6 +4561,8 @@ class CmdRouter:
             try:
                 mids = list(self.pending.keys())
                 now = self._now()
+                self._expire_pending_mid_changes(now)
+                self._expire_pending_firmware_versions(now)
                 for mid in mids:
                     expired_items = self._expire_pending_for_mid(mid, now=now)
                     if expired_items:
@@ -4882,6 +5128,15 @@ class CmdRouter:
                         node_msg_id = (payload[5] << 8) | payload[6]
                         body        = payload[7:]
 
+                    if cmd_code == CMD_GET_VERSION:
+                        self._handle_firmware_version_uplink(
+                            rx_mid=mid,
+                            body=body,
+                            node_msg_id=node_msg_id,
+                            ts=ts,
+                        )
+                        return
+
                     if cmd_code == CMD_SET_RTC_KST and len(body) == 0:
                         self._handle_rtc_kst_request(
                             mid=mid,
@@ -5284,17 +5539,48 @@ class CmdRouter:
                         return """
 
                     uid_str = uid_bytes.hex()
-                    self._remember_node_seen(mid=mid, ts=ts, uid=uid_str, mac=mac)
                     result = "success" if ok else "fail"
                     body_msg_id16 = int(msg_id32) & 0xFFFF
                     match_id = int(node_msg_id) if node_msg_id is not None else body_msg_id16
+                    mid_change = self._pop_pending_mid_change(uid_str, match_id)
+                    if mid_change is not None:
+                        if ok:
+                            changed = self.store.confirm_mid_change(
+                                uid_str,
+                                mid_change["new_mid"],
+                                mid_change.get("new_channel"),
+                            ) if self.store is not None else None
+                            if changed is None:
+                                if self.store is not None and hasattr(self.store, "cancel_mid_change"):
+                                    self.store.cancel_mid_change(uid_str)
+                                ok = 0
+                                err_code = -1
+                                result = "fail"
+                            else:
+                                print(
+                                    f"[GW MID CHANGE CONFIRMED] uid={uid_str} "
+                                    f"old_mid={mid_change.get('old_mid')} "
+                                    f"new_mid={mid_change.get('new_mid')}",
+                                    flush=True,
+                                )
+                                self._remember_node_seen(
+                                    mid=mid_change["new_mid"], ts=ts,
+                                    uid=uid_str, mac=mac,
+                                )
+                        else:
+                            if self.store is not None and hasattr(self.store, "cancel_mid_change"):
+                                self.store.cancel_mid_change(uid_str)
+                    else:
+                        self._remember_node_seen(mid=mid, ts=ts, uid=uid_str, mac=mac)
                     is_setting_ack_wire = (
                         cmd_code == CMD_SETTING_ACK_TRANSPORT
                         and int(t_val) == ACK_T
                         and node_msg_id is not None
                         and (int(node_msg_id) & 0xFFFF) == body_msg_id16
                     )
-                    if int(t_val) in LIGHT_ACK_TYPES:
+                    if mid_change is not None:
+                        pend = mid_change
+                    elif int(t_val) in LIGHT_ACK_TYPES:
                         pend = self._pending_pop_power_ack(
                             mid,
                             match_id,
@@ -5550,20 +5836,23 @@ class CmdRouter:
 
                     # UID 소유 MID 기반 relay drop
                     owner_mid = None
+                    allowed_owner_mids = set()
                     if self.store is not None:
                         try:
-                            for r in self.store.all_nodes():
-                                if not isinstance(r, dict):
-                                    continue
-
-                                r_uid = str(r.get("uid") or "").lower()
-                                if r_uid == uid_str.lower():
-                                    owner_mid = int(r.get("mid") or 0)
-                                    break
+                            owner = self.store.get_by_uid(uid_str)
+                            if isinstance(owner, dict):
+                                owner_mid = int(owner.get("mid") or 0)
+                            if hasattr(self.store, "allowed_mids_for_uid"):
+                                allowed_owner_mids = self.store.allowed_mids_for_uid(
+                                    uid_str, now=ts
+                                )
+                            elif owner_mid:
+                                allowed_owner_mids = {owner_mid}
 
                         except Exception as e:
                             print(f"[GW SNAP OWNER_LOOKUP_ERR] uid={uid_str} err={e}", flush=True)
                             owner_mid = None
+                            allowed_owner_mids = set()
 
                     print(
                         f"[GW SNAP OWNER CHECK] rx_mid={rx_mid} owner_mid={owner_mid} "
@@ -5571,7 +5860,7 @@ class CmdRouter:
                         flush=True,
                     )
 
-                    if owner_mid and owner_mid != rx_mid:
+                    if owner_mid and rx_mid not in allowed_owner_mids:
                         print(
                             f"[GW SNAP DROP RELAY] rx_mid={rx_mid} owner_mid={owner_mid} "
                             f"uid={uid_str} ttl={snap.get('ttl')} snap_count={snap.get('snap_count')}",
