@@ -76,6 +76,7 @@ class MqttBridge:
         self._net_watch_stop = threading.Event()
         self._net_last_link_up = None
         self._reconnect_lock = threading.Lock()
+        self._network_manager = None
 
     # --------------- public API ---------------
     def add_handler(self, fn):
@@ -110,6 +111,50 @@ class MqttBridge:
     def set_router(self, router):
         self.router = router
 
+    def set_network_manager(self, network_manager):
+        """Use NetworkManager as the source of active-link state.
+
+        NetworkManager calls back only after route priority has changed.  The
+        callback then drops the old MQTT socket so paho reconnects through the
+        newly selected interface.
+        """
+        self._network_manager = network_manager
+        if network_manager is None:
+            return
+        iface = getattr(network_manager, "active_iface", None)
+        if iface:
+            self._net_iface = iface
+        network_manager.add_listener(self._on_network_changed)
+
+    def _current_net_iface(self):
+        manager = self._network_manager
+        if manager is not None:
+            iface = getattr(manager, "active_iface", None)
+            if iface:
+                return iface
+        return self._net_iface
+
+    def _on_network_changed(self, status):
+        iface = status.get("interface") if isinstance(status, dict) else None
+        reason = status.get("reason", "network_changed") if isinstance(status, dict) else "network_changed"
+        if iface:
+            self._net_iface = iface
+        self.force_reconnect(reason=reason)
+
+    def force_reconnect(self, reason="network_changed"):
+        """Recreate the MQTT TCP connection using the current system route."""
+        iface = self._current_net_iface()
+        self._connected_event.clear()
+        self._link_down_reconnect_not_before = 0.0
+        self._net_last_link_up = None
+        print(f"[MQTT] network changed iface={iface}; reconnect reason={reason}", flush=True)
+        self.log.warning("mqtt network changed iface=%s reason=%s", iface, reason)
+        try:
+            self._client._sock_close()
+        except Exception as e:
+            self.log.warning("mqtt socket close for network change failed err=%r", e)
+        self._start_reconnect_worker(f"network_change:{reason}")
+
     def _gateway_status_payload(self, status, reason=None):
         payload = {
             "cmd": "gateway_status",
@@ -131,7 +176,15 @@ class MqttBridge:
         )
 
     def _read_net_link_up(self):
-        base = f"/sys/class/net/{self._net_iface}"
+        manager = self._network_manager
+        if manager is not None:
+            try:
+                return manager.link_ready()
+            except Exception as e:
+                self.log.warning("network manager link check failed err=%r", e)
+
+        iface = self._current_net_iface()
+        base = f"/sys/class/net/{iface}"
         carrier_path = os.path.join(base, "carrier")
         operstate_path = os.path.join(base, "operstate")
 
@@ -161,21 +214,22 @@ class MqttBridge:
         t.start()
 
     def _network_watchdog_loop(self):
-        print(f"[NET] watchdog start iface={self._net_iface}")
-        self.log.info("network watchdog start iface=%s", self._net_iface)
+        print(f"[NET] watchdog start iface={self._current_net_iface()}")
+        self.log.info("network watchdog start iface=%s", self._current_net_iface())
 
         while not self._net_watch_stop.is_set():
+            iface = self._current_net_iface()
             link_up = self._read_net_link_up()
             if link_up is not None and link_up != self._net_last_link_up:
                 self._net_last_link_up = link_up
                 if link_up:
-                    print(f"[NET] {self._net_iface} link up; ensure MQTT reconnect")
-                    self.log.warning("network link up iface=%s - ensure mqtt reconnect", self._net_iface)
+                    print(f"[NET] {iface} link up; ensure MQTT reconnect")
+                    self.log.warning("network link up iface=%s - ensure mqtt reconnect", iface)
                     if not self._connected_event.is_set():
                         self._start_reconnect_worker("link_up")
                 else:
-                    print(f"[NET] {self._net_iface} link down; closing MQTT socket")
-                    self.log.warning("network link down iface=%s - closing mqtt socket", self._net_iface)
+                    print(f"[NET] {iface} link down; closing MQTT socket")
+                    self.log.warning("network link down iface=%s - closing mqtt socket", iface)
                     self._connected_event.clear()
                     self._link_down_reconnect_not_before = time.monotonic() + self._link_down_reconnect_delay_sec
                     self._close_mqtt_socket_for_link_down()
@@ -204,10 +258,11 @@ class MqttBridge:
         try:
             delay = 1
             while True:
+                iface = self._current_net_iface()
                 link_up = self._read_net_link_up()
                 if link_up is False:
-                    print(f"[MQTT] reconnect wait: {self._net_iface} link down")
-                    self.log.warning("mqtt reconnect wait link down iface=%s reason=%s", self._net_iface, reason)
+                    print(f"[MQTT] reconnect wait: {iface} link down")
+                    self.log.warning("mqtt reconnect wait link down iface=%s reason=%s", iface, reason)
                     time.sleep(delay)
                     delay = min(delay * 2, 60)
                     continue

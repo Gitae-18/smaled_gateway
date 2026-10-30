@@ -51,12 +51,28 @@ CMD_GET_VERSION        = 0x46
 
 T_SNAP = 0x01
 T_LIGHT_STATE_EVENT = 0x15
+# Compact 0x15 body sent by current node firmware (40 bytes).  With the
+# 7-byte transport header this is a 47-byte Wi-SUN DATA payload.
+LIGHT_STATE_EVENT_COMPACT_FMT = "<B12sBBBBfffBIiH"
+LIGHT_STATE_EVENT_COMPACT_SIZE = struct.calcsize(LIGHT_STATE_EVENT_COMPACT_FMT)
 LIGHT_STATE_EVENT_BIN_FMT = "<B12sIBBBBIfffBIiIi"
 LIGHT_STATE_EVENT_BIN_SIZE = struct.calcsize(LIGHT_STATE_EVENT_BIN_FMT)
 LIGHT_STATE_EVENT_RTC_EXT_FMT = "<HBBBBBB"
 LIGHT_STATE_EVENT_RTC_EXT_SIZE = struct.calcsize(LIGHT_STATE_EVENT_RTC_EXT_FMT)
 LIGHT_STATE_EVENT_BIN_SIZE_WITH_RTC = LIGHT_STATE_EVENT_BIN_SIZE + LIGHT_STATE_EVENT_RTC_EXT_SIZE
+LIGHT_STATE_EVENT_RUL_FMT = "<H"
+LIGHT_STATE_EVENT_RUL_SIZE = struct.calcsize(LIGHT_STATE_EVENT_RUL_FMT)
+LIGHT_STATE_EVENT_RUL_OFFSET = LIGHT_STATE_EVENT_BIN_SIZE_WITH_RTC
+LIGHT_STATE_EVENT_BIN_SIZE_WITH_RUL = LIGHT_STATE_EVENT_RUL_OFFSET + LIGHT_STATE_EVENT_RUL_SIZE
+LIGHT_STATE_EVENT_RUL_PERCENT_INVALID = 0xFFFF
 SNAP_FFT_PAIRS = 2
+# 0x15 light-state events carry the same ultrasonic FFT domain as SNAP.
+# Keep these constraints at the decoder boundary so a misaligned candidate
+# cannot win merely because its arbitrary integers are finite.
+LIGHT_EVENT_FFT_MIN_HZ = 70_000.0
+LIGHT_EVENT_FFT_MAX_HZ = 150_000.0
+LIGHT_EVENT_FFT_MAX_AMP = 10_000.0
+LIGHT_EVENT_REQUIRED_VALID_FLAGS = 0x01 | 0x02 | 0x04
 # Node snap layout: t, ttl, uid, volt, curr, temp, light_on,
 # fft0{uint32 freq_hz_x100, int32 amp_x1000},
 # snap_count, ai_mse_x1000000, flags
@@ -770,7 +786,8 @@ def _unpack_light_state_event_candidate(b: bytes, layout: str, offsets: dict):
         uid_bytes = bytes(b[1:13])
         event_id = struct.unpack_from("<I", b, offsets["event_id"])[0]
         valid_flags = int(b[offsets["valid_flags"]]) & 0xFF
-        light_on = int(b[offsets["light_on"]]) & 0x01
+        light_on_raw = int(b[offsets["light_on"]])
+        light_on = light_on_raw & 0x01
         mode = int(b[offsets["mode"]])
         reason = int(b[offsets["reason"]])
         tick_ms = struct.unpack_from("<I", b, offsets["tick_ms"])[0]
@@ -796,6 +813,7 @@ def _unpack_light_state_event_candidate(b: bytes, layout: str, offsets: dict):
         "uid_bytes": uid_bytes,
         "event_id": int(event_id),
         "valid_flags": valid_flags,
+        "light_on_raw": light_on_raw,
         "light_on": light_on,
         "mode": mode,
         "reason": reason,
@@ -895,86 +913,245 @@ def _light_event_fft_usable(event: dict) -> bool:
 
     try:
         fft_count_raw = int(event.get("fft_count_raw", event.get("fft_count", 0)) or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
-    if fft_count_raw <= 0:
+    if not (1 <= fft_count_raw <= SNAP_FFT_PAIRS):
         return False
-    return not _fft_missing_value(event.get("fft_pairs"))
+
+    pairs = event.get("fft_pairs")
+    if not isinstance(pairs, (list, tuple)) or len(pairs) != fft_count_raw:
+        return False
+
+    for pair in pairs:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            return False
+        freq = _finite_number(pair[0])
+        amp = _finite_number(pair[1])
+        if freq is None or amp is None:
+            return False
+        if not (LIGHT_EVENT_FFT_MIN_HZ <= freq <= LIGHT_EVENT_FFT_MAX_HZ):
+            return False
+        if not (0.0 <= amp <= LIGHT_EVENT_FFT_MAX_AMP):
+            return False
+
+    return True
+
+
+def _light_event_voltage_current_usable(event: dict) -> bool:
+    valid_flags = int(event.get("valid_flags", 0) or 0)
+    if not (valid_flags & 0x02):
+        return True
+    return (
+        _bounded_number(event.get("voltage"), "voltage") is not None
+        and _bounded_number(event.get("current"), "current") is not None
+    )
+
+
+def _light_event_required_fields_usable(event: dict) -> bool:
+    """Validate the mandatory light, voltage/current and temperature fields."""
+    valid_flags = int(event.get("valid_flags", 0) or 0)
+    if (valid_flags & LIGHT_EVENT_REQUIRED_VALID_FLAGS) != LIGHT_EVENT_REQUIRED_VALID_FLAGS:
+        return False
+    return (
+        int(event.get("light_on_raw", event.get("light_on", -1))) in (0, 1)
+        and _light_event_voltage_current_usable(event)
+        and _light_event_temperature_usable(event)
+    )
 
 
 def _light_event_measurements_usable(event: dict) -> bool:
     """Return whether every measurement marked valid by the node parses correctly."""
     return (
-        _light_event_temperature_usable(event)
+        _light_event_required_fields_usable(event)
         and _light_event_fft_usable(event)
     )
 
 
+def _light_event_layout_matches_payload(b: bytes, candidate: dict) -> bool:
+    """Validate wire length and required zero padding for a layout candidate."""
+    offsets = candidate["parse_offsets"]
+    base_size = offsets["rtc"]
+    valid_rtc = bool(candidate["valid_flags"] & 0x10)
+
+    allowed_sizes = {base_size}
+    if valid_rtc:
+        rtc_size = {
+            "u8_year_offset_2019": 7,
+            "u16_year": LIGHT_STATE_EVENT_RTC_EXT_SIZE,
+        }.get(candidate.get("rtc_layout"))
+        if rtc_size is None:
+            return False
+        allowed_sizes = {base_size + rtc_size}
+        if candidate.get("rtc_layout") == "u16_year":
+            allowed_sizes.add(base_size + rtc_size + LIGHT_STATE_EVENT_RUL_SIZE)
+    if len(b) not in allowed_sizes:
+        return False
+
+    # These bytes are ABI padding, never data.  Checking them prevents a
+    # packed packet from being reinterpreted as an aligned C structure.
+    layout = candidate.get("parse_layout")
+    padding = {
+        "packed_fft_u32_aligned": ((38, 40),),
+        "temp_pad_1_scaled_fft_i32": ((33, 34),),
+        "temp_pad_1_fft_u32_aligned": ((33, 34), (39, 40)),
+        "c_aligned_scaled_fft_i32": ((13, 16), (41, 44)),
+    }.get(layout, ())
+    return all(all(value == 0 for value in b[start:end]) for start, end in padding)
+
+
+def _unpack_compact_light_state_event(b: bytes):
+    if len(b) != LIGHT_STATE_EVENT_COMPACT_SIZE:
+        return None
+    try:
+        (
+            t_val,
+            uid_bytes,
+            valid_flags,
+            light_on_raw,
+            mode,
+            reason,
+            voltage,
+            current,
+            temp,
+            fft_count_raw,
+            freq_x100,
+            amp_x1000,
+            rul_percent_x100,
+        ) = struct.unpack(LIGHT_STATE_EVENT_COMPACT_FMT, b)
+    except struct.error:
+        return None
+
+    if t_val != T_LIGHT_STATE_EVENT or valid_flags & ~0x1F:
+        return None
+    if light_on_raw not in (0, 1) or fft_count_raw not in (0, 1):
+        return None
+
+    fft_pairs = []
+    if fft_count_raw == 1:
+        fft_pairs.append(
+            (
+                float(int(freq_x100)) / 100.0,
+                float(int(amp_x1000)) / 1000.0,
+            )
+        )
+
+    rul_valid = int(rul_percent_x100) <= 10_000
+    event = {
+        "t": int(t_val),
+        "uid_bytes": bytes(uid_bytes),
+        # Compact 0x15 omits these.  The caller restores event_id from the
+        # transport msg_id and uses its gateway receive timestamp for time.
+        "event_id": None,
+        "tick_ms": None,
+        "valid_flags": int(valid_flags),
+        "light_on_raw": int(light_on_raw),
+        "light_on": int(light_on_raw),
+        "mode": int(mode),
+        "reason": int(reason),
+        "voltage": float(voltage),
+        "current": float(current),
+        "temp": float(temp),
+        "fft_count": int(fft_count_raw),
+        "fft_count_raw": int(fft_count_raw),
+        "fft_pairs": fft_pairs,
+        "fft_raw": {
+            "f1_x100": int(freq_x100),
+            "a1_x1000": int(amp_x1000),
+            "f2_x100": 0,
+            "a2_x1000": 0,
+        },
+        "rul_present": True,
+        "rul_percent": (
+            float(rul_percent_x100) / 100.0 if rul_valid else None
+        ),
+        "rul_raw": {
+            "percent_x100": int(rul_percent_x100),
+            "invalid": not rul_valid,
+        },
+        "parse_layout": "compact_40_scaled_fft_i32_rul",
+        "parse_offsets": {
+            "valid_flags": 13,
+            "light_on": 14,
+            "mode": 15,
+            "reason": 16,
+            "voltage": 17,
+            "current": 21,
+            "temp": 25,
+            "fft_count": 29,
+            "f1": 30,
+            "a1": 34,
+            "rul": 38,
+        },
+        "layout_structural_match": True,
+    }
+    event["parse_score"] = _light_event_measure_score(
+        event["temp"],
+        event["fft_count_raw"],
+        event["fft_pairs"],
+        None,
+        event["valid_flags"],
+    )
+    return event
+
+
 def unpack_light_state_event_bin(b: bytes):
+    if len(b) == LIGHT_STATE_EVENT_COMPACT_SIZE:
+        return _unpack_compact_light_state_event(b)
+
     if len(b) < LIGHT_STATE_EVENT_BIN_SIZE or b[0] != T_LIGHT_STATE_EVENT:
         return None
 
-    candidates = [
-        (
-            "packed_scaled_fft_i32",
-            {
-                "event_id": 13, "valid_flags": 17, "light_on": 18, "mode": 19,
-                "reason": 20, "tick_ms": 21, "voltage": 25, "current": 29,
-                "temp": 33, "fft_count": 37, "f1": 38, "a1": 42,
-                "f2": 46, "a2": 50, "rtc": 54,
-            },
-        ),
-        (
-            "packed_fft_u32_aligned",
-            {
-                "event_id": 13, "valid_flags": 17, "light_on": 18, "mode": 19,
-                "reason": 20, "tick_ms": 21, "voltage": 25, "current": 29,
-                "temp": 33, "fft_count": 37, "f1": 40, "a1": 44,
-                "f2": 48, "a2": 52, "rtc": 56,
-            },
-        ),
-        (
-            "temp_pad_1_scaled_fft_i32",
-            {
-                "event_id": 13, "valid_flags": 17, "light_on": 18, "mode": 19,
-                "reason": 20, "tick_ms": 21, "voltage": 25, "current": 29,
-                "temp": 34, "fft_count": 38, "f1": 39, "a1": 43,
-                "f2": 47, "a2": 51, "rtc": 55,
-            },
-        ),
-        (
-            "temp_pad_1_fft_u32_aligned",
-            {
-                "event_id": 13, "valid_flags": 17, "light_on": 18, "mode": 19,
-                "reason": 20, "tick_ms": 21, "voltage": 25, "current": 29,
-                "temp": 34, "fft_count": 38, "f1": 40, "a1": 44,
-                "f2": 48, "a2": 52, "rtc": 56,
-            },
-        ),
-        (
-            "c_aligned_scaled_fft_i32",
-            {
-                "event_id": 16, "valid_flags": 20, "light_on": 21, "mode": 22,
-                "reason": 23, "tick_ms": 24, "voltage": 28, "current": 32,
-                "temp": 36, "fft_count": 40, "f1": 44, "a1": 48,
-                "f2": 52, "a2": 56, "rtc": 60,
-            },
-        ),
-    ]
-
-    parsed = []
-    for layout, offsets in candidates:
-        candidate = _unpack_light_state_event_candidate(b, layout, offsets)
-        if candidate is not None:
-            parsed.append(candidate)
-    if not parsed:
+    # 0x15 has a defined packed wire format.  It must never be guessed from
+    # the 0x12 SNAP layout or from native C ABI alignment.  In particular,
+    # event_id/tick_ms bytes can look like large FFT values when shifted.
+    offsets = {
+        "event_id": 13, "valid_flags": 17, "light_on": 18, "mode": 19,
+        "reason": 20, "tick_ms": 21, "voltage": 25, "current": 29,
+        "temp": 33, "fft_count": 37, "f1": 38, "a1": 42,
+        "f2": 46, "a2": 50, "rtc": 54,
+    }
+    event = _unpack_light_state_event_candidate(
+        b,
+        "packed_scaled_fft_i32",
+        offsets,
+    )
+    if event is None:
         return None
 
-    best = max(parsed, key=lambda item: item.get("parse_score", -1000))
-    if best.get("parse_score", -1000) < -20:
+    if event["valid_flags"] & ~0x1F:
+        return None
+    if not _light_event_layout_matches_payload(b, event):
         return None
 
-    return best
+    rul_present = len(b) == LIGHT_STATE_EVENT_BIN_SIZE_WITH_RUL
+    rul_percent_x100 = None
+    rul_percent = None
+    if rul_present:
+        try:
+            rul_percent_x100 = struct.unpack_from(
+                LIGHT_STATE_EVENT_RUL_FMT,
+                b,
+                LIGHT_STATE_EVENT_RUL_OFFSET,
+            )[0]
+        except struct.error:
+            return None
+        if rul_percent_x100 <= 10_000:
+            rul_percent = float(rul_percent_x100) / 100.0
+
+    event["rul_present"] = rul_present
+    event["rul_percent"] = rul_percent
+    event["rul_raw"] = {
+        "percent_x100": None if rul_percent_x100 is None else int(rul_percent_x100),
+        "invalid": bool(
+            rul_present
+            and (
+                rul_percent_x100 == LIGHT_STATE_EVENT_RUL_PERCENT_INVALID
+                or rul_percent_x100 > 10_000
+            )
+        ),
+    }
+    event["layout_structural_match"] = True
+    return event
      
 def cut_cfg_text(payload: bytes) -> bytes:
     # 1) 가장 확실한 종료: ":<ETX>"
@@ -1259,7 +1436,17 @@ def build_rtc_kst_payload_from_dt(when: datetime.datetime) -> bytes:
     ])
 
 class CmdRouter:
-    def __init__(self, wisun, mqtt, reg, attach_raw_bytes: bool = False,  gwid: str = "gw001", store: NodeStore | None = None, scheduler = None,):
+    def __init__(
+        self,
+        wisun,
+        mqtt,
+        reg,
+        attach_raw_bytes: bool = False,
+        gwid: str = "gw001",
+        store: NodeStore | None = None,
+        scheduler=None,
+        network_manager=None,
+    ):
         self.wisun = wisun
         self.mqtt = mqtt
         self.reg  = reg
@@ -1267,6 +1454,7 @@ class CmdRouter:
         self.gwid = gwid
         self.store = store
         self.scheduler = scheduler
+        self.network_manager = network_manager
         self.runtime_config_path = "config/gw_runtime_config.json"
 
         self.direct_uplink_publish = str(os.getenv("DIRECT_UPLINK_PUBLISH", "1")).lower() not in ("0", "false", "no", "off")
@@ -2011,6 +2199,131 @@ class CmdRouter:
 
                 threading.Thread(target=_lte_on_worker, daemon=True).start()
 
+            def _gw_set_network_mode(mode_override=None, response_cmd="set_network_mode"):
+                manager = self.network_manager
+                requested_mode = (
+                    mode_override
+                    or data.get("mode")
+                    or data.get("network_mode")
+                    or payload.get("mode")
+                    or payload.get("network_mode")
+                )
+                if manager is None:
+                    resp = {
+                        "cmd": f"{response_cmd}_ack",
+                        "gid": self.gwid,
+                        "result": "fail",
+                        "reason": "network_manager_unavailable",
+                        "msg_id": raw_msg_id,
+                        "ts": int(time.time()),
+                    }
+                    _publish_gw(resp)
+                    return
+                if requested_mode is None:
+                    resp = {
+                        "cmd": f"{response_cmd}_ack",
+                        "gid": self.gwid,
+                        "result": "fail",
+                        "reason": "missing_mode",
+                        "valid_modes": ["ethernet", "lte", "auto"],
+                        "msg_id": raw_msg_id,
+                        "ts": int(time.time()),
+                    }
+                    _publish_gw(resp)
+                    return
+
+                try:
+                    normalized_mode = manager._normalize_mode(requested_mode)
+                except (TypeError, ValueError) as exc:
+                    resp = {
+                        "cmd": f"{response_cmd}_ack",
+                        "gid": self.gwid,
+                        "result": "fail",
+                        "reason": str(exc),
+                        "valid_modes": ["ethernet", "lte", "auto"],
+                        "msg_id": raw_msg_id,
+                        "ts": int(time.time()),
+                    }
+                    _publish_gw(resp)
+                    return
+
+                accepted = {
+                    "cmd": f"{response_cmd}_ack",
+                    "gid": self.gwid,
+                    "result": "accepted",
+                    "mode": normalized_mode,
+                    "msg_id": raw_msg_id,
+                    "ts": int(time.time()),
+                }
+                _publish_gw(accepted)
+
+                def _network_mode_worker():
+                    try:
+                        status = manager.set_mode(
+                            normalized_mode,
+                            persist=True,
+                            reason=f"mqtt:{response_cmd}",
+                        )
+                        expected_active = normalized_mode if normalized_mode != "auto" else status.get("active")
+                        ok = (
+                            bool(status.get("ready"))
+                            and not status.get("last_error")
+                            and status.get("mode") == normalized_mode
+                            and status.get("active") == expected_active
+                        )
+                        resp = {
+                            "cmd": f"{response_cmd}_result",
+                            "gid": self.gwid,
+                            "result": "success" if ok else "fail",
+                            "mode": normalized_mode,
+                            "network": status,
+                            "msg_id": raw_msg_id,
+                            "ts": int(time.time()),
+                        }
+                        if not ok:
+                            resp["reason"] = status.get("last_error") or "network_not_ready"
+                    except Exception as exc:
+                        resp = {
+                            "cmd": f"{response_cmd}_result",
+                            "gid": self.gwid,
+                            "result": "fail",
+                            "mode": normalized_mode,
+                            "reason": str(exc),
+                            "msg_id": raw_msg_id,
+                            "ts": int(time.time()),
+                        }
+                    _publish_gw(resp)
+                    print(f"[CMD] {response_cmd}_result:", resp, flush=True)
+
+                threading.Thread(
+                    target=_network_mode_worker,
+                    name=f"network-mode-{normalized_mode}",
+                    daemon=True,
+                ).start()
+
+            def _gw_get_network_status():
+                if self.network_manager is None:
+                    resp = {
+                        "cmd": "get_network_status_ack",
+                        "gid": self.gwid,
+                        "result": "fail",
+                        "reason": "network_manager_unavailable",
+                        "msg_id": raw_msg_id,
+                        "ts": int(time.time()),
+                    }
+                else:
+                    status = self.network_manager.status(refresh=True)
+                    resp = {
+                        "cmd": "get_network_status_ack",
+                        "gid": self.gwid,
+                        "result": "success",
+                        "network": status,
+                        "msg_id": raw_msg_id,
+                        "ts": int(time.time()),
+                    }
+                _publish_gw(resp)
+                _verbose_print("[CMD] get_network_status_ack:", resp)
+
             def _gw_set_env_interval():
                 interval_raw = (
                     data.get("interval")
@@ -2179,7 +2492,10 @@ class CmdRouter:
                 "set_gw_env_interval": _gw_set_gw_env_interval,
                 "set_gw_time": _gw_set_gw_time,
                 "send_ping": _gw_send_ping,
-                "lte_on": _gw_lte_on,
+                "lte_on": lambda: _gw_set_network_mode("lte", "lte_on"),
+                "set_network_mode": _gw_set_network_mode,
+                "get_network_status": _gw_get_network_status,
+                "get_network_mode": _gw_get_network_status,
             }
 
             h = gw_handlers.get(gw_cmd)
@@ -5046,6 +5362,18 @@ class CmdRouter:
             if isinstance(payload, (bytes, bytearray)):
                 b = bytes(payload)  
                 body = b
+                wrapped_light_event = (
+                    len(payload) in (
+                        7 + LIGHT_STATE_EVENT_COMPACT_SIZE,
+                        7 + LIGHT_STATE_EVENT_BIN_SIZE_WITH_RTC,
+                        7 + LIGHT_STATE_EVENT_BIN_SIZE_WITH_RUL,
+                    )
+                    and payload[7] == T_LIGHT_STATE_EVENT
+                )
+                wrapped_power_ack = (
+                    len(payload) == 7 + POWER_CTRL_ACK_SIZE
+                    and payload[7] in LIGHT_ACK_TYPES
+                )
                 if len(body) == 1 and body[0] == CMD_SET_RTC_KST:
                     self._handle_rtc_kst_request(
                         mid=mid,
@@ -5057,7 +5385,11 @@ class CmdRouter:
                         raw_hex=raw_hex,
                     )
                     return
-                if len(body) >= NODEINFO_SIZE and body[0] == T_NODEINFO_BIN:
+                if (
+                    not (wrapped_light_event or wrapped_power_ack)
+                    and len(body) >= NODEINFO_SIZE
+                    and body[0] == T_NODEINFO_BIN
+                ):
                     info = parse_nodeinfo_bin(body)
 
                     self._remember_node_seen(
@@ -5086,7 +5418,17 @@ class CmdRouter:
                     _verbose_print("[MQTT TX GET_NODE_INFO_BIN]", resp)
                     return       
                 # transport header 없는 순수 Ack/Snap인지 체크 
-                if len(payload) >= ACK_BIN_SIZE and payload[0] in ACK_TYPES:
+                # Wrapped reports/ACKs must be detected before payload[0].
+                # Bytes 0..6 are a transport header; the target MID low byte
+                # may equal an ACK/SNAP type (MID 3600 starts with 0x10).
+                if wrapped_light_event or wrapped_power_ack:
+                    target_mid = payload[0] | (payload[1] << 8)
+                    ttl = payload[2]
+                    cmd_code = payload[3]
+                    flags = payload[4]
+                    node_msg_id = (payload[5] << 8) | payload[6]
+                    body = payload[7:]
+                elif len(payload) >= ACK_BIN_SIZE and payload[0] in ACK_TYPES:
                     body = payload
                     target_mid = ttl = cmd_code = flags = None
                     node_msg_id = None
@@ -5094,7 +5436,13 @@ class CmdRouter:
                     body = payload
                     target_mid = ttl = cmd_code = flags = None
                     node_msg_id = None
-                elif len(payload) >= LIGHT_STATE_EVENT_BIN_SIZE and payload[0] == T_LIGHT_STATE_EVENT:
+                elif (
+                    payload[0] == T_LIGHT_STATE_EVENT
+                    and (
+                        len(payload) == LIGHT_STATE_EVENT_COMPACT_SIZE
+                        or len(payload) >= LIGHT_STATE_EVENT_BIN_SIZE
+                    )
+                ):
                     body = payload
                     target_mid = ttl = cmd_code = flags = None
                     node_msg_id = None
@@ -5182,7 +5530,13 @@ class CmdRouter:
                                 f"len={len(payload)}")
                             _verbose_print("[GW] dropped echoed raw=", raw_hex)
                             return            
-                if len(body) >= LIGHT_STATE_EVENT_BIN_SIZE and body[0] == T_LIGHT_STATE_EVENT:
+                if (
+                    body[0] == T_LIGHT_STATE_EVENT
+                    and (
+                        len(body) == LIGHT_STATE_EVENT_COMPACT_SIZE
+                        or len(body) >= LIGHT_STATE_EVENT_BIN_SIZE
+                    )
+                ):
                     event_rx_ts = int(ts if ts is not None else time.time())
                     try:
                         event = unpack_light_state_event_bin(body)
@@ -5209,6 +5563,19 @@ class CmdRouter:
                         })
                         return
 
+                    if event.get("event_id") is None:
+                        if node_msg_id is not None:
+                            event["event_id"] = int(node_msg_id) & 0xFFFF
+                            event["event_id_source"] = "transport_msg_id"
+                        else:
+                            # Direct compact frames have no device event id.
+                            # Keep the legacy server schema numeric while
+                            # clearly identifying the gateway-derived value.
+                            event["event_id"] = event_rx_ts & 0xFFFFFFFF
+                            event["event_id_source"] = "gateway_rx_ts"
+                    else:
+                        event["event_id_source"] = "payload"
+
                     uid_str = event["uid_bytes"].hex()
                     report_cmd = int(cmd_code) if cmd_code is not None else T_LIGHT_STATE_EVENT
                     report_msg_id = (
@@ -5222,27 +5589,38 @@ class CmdRouter:
                     valid_temp = bool(valid_flags & 0x04)
                     valid_fft = bool(valid_flags & 0x08)
                     valid_rtc = bool(valid_flags & 0x10) and "rtc_year" in event
+                    rul_percent = event.get("rul_percent")
+                    rul_present = bool(event.get("rul_present", False))
+                    required_fields_parse_ok = _light_event_required_fields_usable(event)
+                    voltage_current_parse_ok = _light_event_voltage_current_usable(event)
                     temperature_parse_ok = _light_event_temperature_usable(event)
                     fft_parse_ok = _light_event_fft_usable(event)
-                    usable_measurements = temperature_parse_ok and fft_parse_ok
-                    if valid_temp and not temperature_parse_ok:
+                    usable_measurements = (
+                        required_fields_parse_ok
+                        and fft_parse_ok
+                    )
+                    if not usable_measurements:
                         print(
-                            f"[GW LIGHT_STATE_EVENT TEMP_DROP] mid={mid} uid={uid_str} "
+                            f"[GW LIGHT_STATE_EVENT MEASURE_DROP] mid={mid} uid={uid_str} "
                             f"flags=0x{valid_flags:02X} layout={event.get('parse_layout')} "
-                            f"score={event.get('parse_score')} temp_raw={event.get('temp')} "
+                            f"structural={event.get('layout_structural_match')} "
+                            f"score={event.get('parse_score')} "
+                            f"required_ok={required_fields_parse_ok} "
+                            f"vi_ok={voltage_current_parse_ok} temp_ok={temperature_parse_ok} "
+                            f"fft_ok={fft_parse_ok} voltage_raw={event.get('voltage')} "
+                            f"current_raw={event.get('current')} temp_raw={event.get('temp')} "
+                            f"fft_count_raw={event.get('fft_count_raw', event.get('fft_count'))} "
+                            f"fft_pairs={event.get('fft_pairs')} "
                             f"body_hex={body.hex(' ')}",
                             flush=True,
                         )
+
+                        # Measurements in a 0x15 event are one snapshot.  Do
+                        # not mix valid-looking fields from a corrupt layout
+                        # into the periodic 0x12 telemetry record or MQTT row.
+                        valid_light = False
+                        valid_vi = False
                         valid_temp = False
-                    if valid_fft and not fft_parse_ok:
-                        print(
-                            f"[GW LIGHT_STATE_EVENT FFT_DROP] mid={mid} uid={uid_str} "
-                            f"flags=0x{valid_flags:02X} layout={event.get('parse_layout')} "
-                            f"score={event.get('parse_score')} "
-                            f"fft_count_raw={event.get('fft_count_raw', event.get('fft_count'))} "
-                            f"fft_pairs={event.get('fft_pairs')} body_hex={body.hex(' ')}",
-                            flush=True,
-                        )
                         valid_fft = False
 
                     light_on_val = event["light_on"] if valid_light else None
@@ -5280,7 +5658,9 @@ class CmdRouter:
                         f"offsets={event.get('parse_offsets')} "
                         f"valid_temp={valid_temp} valid_fft={valid_fft} "
                         f"temp_raw={event['temp']} fft_count_raw={event.get('fft_count_raw', event['fft_count'])} "
-                        f"fft_raw={fft_val} rtc={rtc_val} body_hex={body.hex(' ')}",
+                        f"fft_raw={fft_val} rtc={rtc_val} "
+                        f"rul_percent={rul_percent} rul_raw={event.get('rul_raw')} "
+                        f"body_hex={body.hex(' ')}",
                         flush=True,
                     )
                     clean = _sanitize_node_measurements(
@@ -5301,16 +5681,24 @@ class CmdRouter:
                         temperature=temp_val,
                         light_on=light_on_val,
                         fft=fft_val,
+                        rul_percent=rul_percent,
+                        rul_present=rul_present,
                         source="event",
                         update_last_snap_ts=False,
                     )
 
                     resp = {
                         "cmd": "light_state_event",
+                        "packet_type": "light_state_event",
+                        "wire_type": T_LIGHT_STATE_EVENT,
+                        "measurement_source": "light_state_event_0x15",
+                        "rul_percent": rul_percent,
+                        "rul_present": rul_present,
                         "gid": self.gwid,
                         "mid": mid,
                         "uid": uid_str,
                         "event_id": event["event_id"],
+                        "event_id_source": event.get("event_id_source"),
                         "valid_flags": valid_flags,
                         "valid": {
                             "light_on": valid_light,
@@ -5321,12 +5709,14 @@ class CmdRouter:
                         },
                         "raw_valid_flags": valid_flags,
                         "measurement_parse_ok": usable_measurements,
+                        "required_fields_parse_ok": required_fields_parse_ok,
+                        "voltage_current_parse_ok": voltage_current_parse_ok,
                         "temperature_parse_ok": temperature_parse_ok,
                         "fft_parse_ok": fft_parse_ok,
                         "light_on": clean["light_on"],
                         "mode": event["mode"],
                         "reason": event["reason"],
-                        "tick_ms": event["tick_ms"],
+                        "tick_ms": event.get("tick_ms"),
                         "parse_layout": event.get("parse_layout"),
                         "parse_score": event.get("parse_score"),
                         "fallback_from_snap": fallback_from_snap,
@@ -5337,6 +5727,9 @@ class CmdRouter:
                         "fft_count": len(clean["fft"] or []),
                         "fft": clean["fft"] or [],
                         "data": {
+                            "measurement_source": "light_state_event_0x15",
+                            "rul_percent": rul_percent,
+                            "rul_present": rul_present,
                             "voltage": clean["voltage"],
                             "current": clean["current"],
                             "temperature": clean["temperature"],
@@ -5346,6 +5739,7 @@ class CmdRouter:
                             "event_rx_ts": event_rx_ts,
                             "fallback_ts": fallback_ts,
                             "measurement_parse_ok": usable_measurements,
+                            "required_fields_parse_ok": required_fields_parse_ok,
                             "temperature_parse_ok": temperature_parse_ok,
                             "fft_parse_ok": fft_parse_ok,
                             "rtc": rtc_val,

@@ -10,6 +10,7 @@ import os
 import subprocess
 from gps_reader import start_gps_thread
 from logger.logger import setup_logger
+from network_manager import NetworkManager
 
 DEFAULT_GID = "gw001"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -180,12 +181,35 @@ def main():
             config_path="config/node_schedule.config"
         )
 
+        network = NetworkManager(
+            config_path=os.path.join(cfg_dir, "network_mode.json"),
+            mode=os.getenv("NETWORK_MODE") or None,
+            ethernet_iface=os.getenv("ETHERNET_IFACE", "eth0"),
+            lte_iface=os.getenv("LTE_IFACE") or None,
+            lte_connect_service=os.getenv("LTE_CONNECT_SERVICE", "lte_connect.service"),
+            lte_up_service=os.getenv("LTE_UP_SERVICE", "lte.service"),
+            check_interval_sec=float(os.getenv("NETWORK_CHECK_INTERVAL", "5") or 5),
+            logger=log,
+        )
+        network_status = network.start()
+        log.info("network manager started status=%s", network_status)
+
         log.info("init mqtt client host=%s port=%d client_id=%s", "mqtt.hanax.ai", 8883, gid)
         mqtt = MqttBridge(host="mqtt.hanax.ai", port=8883, client_id=gid, username=gid, scheduler=scheduler)
         mqtt.configure_tls_min12_from("/etc/mosquitto/certs", gid)
+        mqtt.set_network_manager(network)
 
         reg = NodeRegistry()
-        router = CmdRouter(wisun, mqtt, reg, attach_raw_bytes=True, gwid=gid, store=store, scheduler=scheduler)
+        router = CmdRouter(
+            wisun,
+            mqtt,
+            reg,
+            attach_raw_bytes=True,
+            gwid=gid,
+            store=store,
+            scheduler=scheduler,
+            network_manager=network,
+        )
 
         mqtt.set_router(router)
 
